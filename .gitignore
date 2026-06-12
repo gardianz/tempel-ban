@@ -1,0 +1,12 @@
+node_modules/
+.env
+.env.*
+!.env.example
+dist/
+*.log
+capture/
+
+# Local-only / third-party — never publish
+contoh/
+docs/
+.claude/

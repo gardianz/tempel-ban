@@ -1,0 +1,19 @@
+{
+  "pairs": [
+    { "symbol": "CC/USDA", "side": "auto", "enabled": false, "postOnly": false, "pingpong": true, "quantityPerOrder": 100 },
+    { "symbol": "CBTC/USDA", "side": "buy", "enabled": true, "postOnly": false, "pingpong": true, "quantityPerOrder": 0.0001, "orderType": "limit" }
+  ],
+  "budgetPerOrder": 150,
+  "orderTtlMinutes": 5,
+  "onBelowMin": "skip",
+  "maxOpenOrders": "auto",
+  "remainingThresholdN": 0,
+  "marketSlippagePct": 0.005,
+  "walletReserve": { "USDA": 0.01, "CBTC": 0.000001 },
+  "minWalletCc": 100,
+  "ratePerMinute": 60,
+  "maxRatePerMinute": 120,
+  "minRequestIntervalMs": 250,
+  "pollIntervalSec": 15,
+  "summaryIntervalMin": 30
+}
