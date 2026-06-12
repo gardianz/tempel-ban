@@ -1,7 +1,7 @@
 import { Bot } from 'grammy';
 import type { Store, StoreEvent } from '../state/store.js';
 import type { Env } from '../config/index.js';
-import { usdValue } from '../types.js';
+import { splitPair, usdValue, type TrackedOrder } from '../types.js';
 
 /**
  * Telegram notifier. Subscribes to store events and pushes order-lifecycle and
@@ -38,12 +38,46 @@ export class TelegramNotifier {
   }
 
   private onEvent(e: StoreEvent): void {
-    // Per-order events are too frequent (≈6/min) for Telegram — those live on the
-    // dashboard. Only deposits (rare, important) are pushed immediately; balances/
-    // order status/rewards go in the periodic summary.
-    if (e.type === 'deposit') {
-      this.send(`${e.ok ? '💰' : '⚠️'} Deposit ${e.amount} ${e.asset} — ${e.ok ? 'ok' : 'FAILED'}`);
+    switch (e.type) {
+      case 'deposit':
+        this.send(`${e.ok ? '💰' : '⚠️'} Deposit ${e.amount} ${e.asset} — ${e.ok ? 'ok' : 'FAILED'}`);
+        return;
+      case 'order:placed':
+        this.send(this.orderMsg(e.order, 'placed'));
+        return;
+      case 'order:updated':
+        // pending / settling transitions (terminal states have their own events).
+        this.send(this.orderMsg(e.order, e.order.status));
+        return;
+      case 'order:settled':
+        this.send(this.orderMsg(e.order, 'settled'));
+        return;
+      case 'order:cancelled':
+        this.send(this.orderMsg(e.order, 'cancelled'));
+        return;
+      default:
+        return;
     }
+  }
+
+  /** Format a per-order lifecycle message (matches the dashboard's order card). */
+  private orderMsg(o: TrackedOrder, status: string): string {
+    const sideIcon = o.side === 'buy' ? '🟢' : '🔴';
+    const stateLabel: Record<string, string> = {
+      placed: `${sideIcon} <b>${o.side.toUpperCase()} ORDER PLACED</b>`,
+      pending: `⏳ <b>${o.side.toUpperCase()} PENDING</b>`,
+      settling: `🔄 <b>${o.side.toUpperCase()} SETTLING</b>`,
+      settled: `✅ <b>${o.side.toUpperCase()} SETTLED</b>`,
+      cancelled: `❌ <b>${o.side.toUpperCase()} CANCELLED</b>`,
+    };
+    const { base } = splitPair(o.symbol);
+    const head = stateLabel[status] ?? `${sideIcon} <b>${o.side.toUpperCase()} ${status.toUpperCase()}</b>`;
+    return [
+      head,
+      `${o.symbol}`,
+      `💰 Price: ${o.price}`,
+      `📦 Qty: ${o.quantity} ${base}`,
+    ].join('\n');
   }
 
   /** Rich periodic snapshot: wallet, Temple balances, order status, rewards. */
