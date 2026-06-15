@@ -1,9 +1,11 @@
 import 'dotenv/config';
+import { resolve } from 'node:path';
 import { initialize } from '@temple-digital-group/temple-canton-js';
 import { loadConfig, loadEnv } from './config/index.js';
 import { RateLimiter } from './core/ratelimiter.js';
 import { TempleSdk } from './services/sdk.js';
 import { TelegramNotifier } from './services/telegram.js';
+import { loadStats, saveStats } from './services/stats-store.js';
 import { Store } from './state/store.js';
 import { Orchestrator } from './workers/orchestrator.js';
 import { Dashboard } from './ui/dashboard.js';
@@ -23,6 +25,12 @@ async function main(): Promise<void> {
   const store = new Store();
   store.network = env.NETWORK;
   store.walletParty = env.LOOP_PARTY_ID;
+
+  // Cumulative stats persist across restarts (volume, fills, deposits, etc.).
+  const statsPath = resolve(process.cwd(), process.env.STATS_FILE ?? 'data/stats.json');
+  store.restoreStats(loadStats(statsPath));
+  const statsTimer = setInterval(() => saveStats(statsPath, store.statsSnapshot()), 30_000);
+  statsTimer.unref?.();
 
   const limiter = new RateLimiter({
     ratePerMinute: config.ratePerMinute,
@@ -82,6 +90,8 @@ async function main(): Promise<void> {
   // 6. Graceful shutdown.
   const shutdown = () => {
     clearInterval(balTimer);
+    clearInterval(statsTimer);
+    saveStats(statsPath, store.statsSnapshot()); // flush final stats
     orchestrator.stop();
     telegram.stop();
     dashboard?.stop(false);

@@ -31,6 +31,20 @@ export interface DepositRecord {
   ccFee: number;
 }
 
+/** Cumulative stats persisted to disk so a restart doesn't reset them. */
+export interface PersistedStats {
+  volumeQuote: number;
+  ordersPlaced: number;
+  ordersSettled: number;
+  ordersCancelled: number;
+  count429: number;
+  settleMsSum: number;
+  settleMsCount: number;
+  placedGapSumMs: number;
+  placedGapCount: number;
+  deposits: DepositRecord[];
+}
+
 const RING = 200;
 const DEPOSIT_RING = 5000;
 
@@ -288,6 +302,45 @@ export class Store extends EventEmitter {
 
   recentLog(n = 50): TrackedOrder[] {
     return this.log.slice(-n).reverse();
+  }
+
+  /** Snapshot the cumulative stats for persistence (excludes per-session state). */
+  statsSnapshot(): PersistedStats {
+    return {
+      volumeQuote: this.counters.volumeQuote,
+      ordersPlaced: this.counters.ordersPlaced,
+      ordersSettled: this.counters.ordersSettled,
+      ordersCancelled: this.counters.ordersCancelled,
+      count429: this.counters.count429,
+      settleMsSum: this.settleMsSum,
+      settleMsCount: this.settleMsCount,
+      placedGapSumMs: this.placedGapSumMs,
+      placedGapCount: this.placedGapCount,
+      deposits: [...this.deposits],
+    };
+  }
+
+  /**
+   * Rehydrate cumulative stats loaded from disk. Per-session state (uptime via
+   * startedAt, lastPlacedAt) is intentionally NOT restored so uptime stays
+   * per-process and the first placement after a restart doesn't log the offline
+   * gap as a placement interval.
+   */
+  restoreStats(s: Partial<PersistedStats> | undefined): void {
+    if (!s) return;
+    this.counters.volumeQuote = s.volumeQuote ?? 0;
+    this.counters.ordersPlaced = s.ordersPlaced ?? 0;
+    this.counters.ordersSettled = s.ordersSettled ?? 0;
+    this.counters.ordersCancelled = s.ordersCancelled ?? 0;
+    this.counters.count429 = s.count429 ?? 0;
+    this.settleMsSum = s.settleMsSum ?? 0;
+    this.settleMsCount = s.settleMsCount ?? 0;
+    this.placedGapSumMs = s.placedGapSumMs ?? 0;
+    this.placedGapCount = s.placedGapCount ?? 0;
+    if (Array.isArray(s.deposits)) {
+      this.deposits.length = 0;
+      this.deposits.push(...s.deposits.slice(-DEPOSIT_RING));
+    }
   }
 
   get uptimeMs(): number {

@@ -5,6 +5,7 @@ node_modules/
 dist/
 *.log
 capture/
+data/
 
 # Local-only / third-party — never publish
 contoh/
