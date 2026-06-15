@@ -47,6 +47,12 @@ export interface TrackedOrder {
   status: NormalizedStatus;
   placedAt: number;
   updatedAt: number;
+  /** First time the order became filled (pending/settling) — start of the settle clock. */
+  pendingAt?: number;
+  /** Time taken from first fill (pending) to fully settled, in ms (set on settle). */
+  settleMs?: number;
+  /** Estimated CC reward this order earned (set on settle, from the 30d reward/volume ratio). */
+  estRewardCc?: number;
   /** First time the order was seen gone from the active book (for cancel grace). */
   goneSince?: number;
 }

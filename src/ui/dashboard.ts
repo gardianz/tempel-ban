@@ -83,14 +83,20 @@ export class Dashboard {
       case 'order:updated': // pending → settling (filled, settling on-chain)
         this.logBox.log(`{blue-fg}${String(e.order.status).toUpperCase()}{/} ${e.order.symbol} ${id(e.order)}`);
         break;
-      case 'order:settled':
-        this.logBox.log(`{cyan-fg}SETTLED{/} ${e.order.side} ${e.order.symbol} @ ${e.order.price} (${id(e.order)})`);
+      case 'order:settled': {
+        const took = e.order.settleMs !== undefined ? ` in ${fmtDur(e.order.settleMs)}` : '';
+        const rwd = e.order.estRewardCc !== undefined ? ` ~${e.order.estRewardCc.toFixed(4)} CC` : '';
+        this.logBox.log(`{cyan-fg}SETTLED{/} ${e.order.side} ${e.order.symbol} @ ${e.order.price} (${id(e.order)})${took}{green-fg}${rwd}{/}`);
         break;
+      }
       case 'order:cancelled':
         this.logBox.log(`{yellow-fg}CANCELLED{/} ${e.order.symbol} ${id(e.order)}`);
         break;
       case 'deposit':
         this.logBox.log(`{magenta-fg}DEPOSIT{/} ${e.amount} ${e.asset} ${e.ok ? 'ok' : 'FAIL'}`);
+        break;
+      case 'info':
+        this.logBox.log(`{gray-fg}»{/} ${e.scope}: ${e.message}`);
         break;
       case 'error':
         this.logBox.log(`{red-fg}ERR{/} ${e.scope}: ${e.message}`);
@@ -142,12 +148,17 @@ export class Dashboard {
     const r30 = this.store.ccEarned30d?.toFixed(2) ?? '?';
     const rTot = this.store.ccEarnedTotal?.toFixed(2) ?? '?';
     const fees = this.store.takerFees !== undefined ? `${this.store.makerFees}/${this.store.takerFees}` : '?';
+    const avg = this.store.avgSettleMs;
+    const fs = this.store.fillStats();
+    const dep = this.store.depositTotals();
+    const depToday = Object.entries(dep.today).map(([k, v]) => `${v.toFixed(3)} ${k}`).join(', ') || '-';
+    const depMonth = Object.entries(dep.month).map(([k, v]) => `${v.toFixed(3)} ${k}`).join(', ') || '-';
     this.statsBox.setContent(
-      `{bold}Orders{/}\n` +
-        `  placed   : ${oc.placed}\n` +
-        `  pending  : ${oc.pending}\n` +
-        `  settling : ${oc.settling}\n` +
-        `  settled  : ${c.ordersSettled}\n` +
+      `{bold}Orders{/}  placed ${oc.placed} | pending ${oc.pending} | settling ${oc.settling} | settled ${c.ordersSettled}\n` +
+        `  fill ${(fs.fillRate * 100).toFixed(0)}% (${fs.filled}) | cancel ${(fs.cancelRate * 100).toFixed(0)}% (${fs.cancelled})\n` +
+        `  avg settle ${avg !== undefined ? fmtDur(avg) : '-'}\n` +
+        `{bold}Deposit{/}  today ${depToday} (fee ${dep.todayCcFee.toFixed(2)} CC)\n` +
+        `  month ${depMonth} (fee ${dep.monthCcFee.toFixed(2)} CC)\n` +
         `{bold}Rewards (CC){/}  30d ${r30} / total ${rTot}  fees m/t ${fees}`,
     );
 
@@ -174,4 +185,14 @@ export class Dashboard {
 
 function fmt(n?: number): string {
   return n === undefined ? '-' : String(n);
+}
+
+/** Human duration: 4.2s, 1m12s, 2h3m. */
+function fmtDur(ms: number): string {
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m${s % 60}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h${m % 60}m`;
 }

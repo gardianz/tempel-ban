@@ -72,12 +72,17 @@ export class TelegramNotifier {
     };
     const { base } = splitPair(o.symbol);
     const head = stateLabel[status] ?? `${sideIcon} <b>${o.side.toUpperCase()} ${status.toUpperCase()}</b>`;
-    return [
+    const lines = [
       head,
       `${o.symbol}`,
       `💰 Price: ${o.price}`,
       `📦 Qty: ${o.quantity} ${base}`,
-    ].join('\n');
+    ];
+    if (status === 'settled') {
+      if (o.settleMs !== undefined) lines.push(`⏱ Settle: ${fmtDur(o.settleMs)} (pending→settled)`);
+      if (o.estRewardCc !== undefined) lines.push(`🎁 Est. reward: ~${o.estRewardCc.toFixed(4)} CC`);
+    }
+    return lines.join('\n');
   }
 
   /** Rich periodic snapshot: wallet, Temple balances, order status, rewards. */
@@ -86,6 +91,9 @@ export class TelegramNotifier {
     const px = store.oraclePrices;
     const upMin = Math.floor(store.uptimeMs / 60_000);
     const oc = store.orderCounts();
+    const avg = store.avgSettleMs;
+    const fs = store.fillStats();
+    const dep = store.depositTotals();
 
     const temple = Object.entries(store.tradingDetailed)
       .map(([k, v]) => `  ${k}: ${v.unlocked.toFixed(4)} unl / ${v.locked.toFixed(4)} lck ($${usdValue(k, v.unlocked + v.locked, px).toFixed(2)})`)
@@ -94,12 +102,24 @@ export class TelegramNotifier {
       .filter(([, v]) => Number(v) > 0)
       .map(([k, v]) => `  ${k}: ${Number(v).toFixed(4)} ($${usdValue(k, Number(v), px).toFixed(2)})`)
       .join('\n');
+    const depToday = Object.entries(dep.today).map(([k, v]) => `${v.toFixed(3)} ${k}`).join(', ') || '-';
+    const depMonth = Object.entries(dep.month).map(([k, v]) => `${v.toFixed(3)} ${k}`).join(', ') || '-';
+    // Current per-symbol order rate cap (re-checked ~every 5 min, applied on change).
+    const rates = [...store.pairs.values()]
+      .filter((p) => p.orderRate)
+      .map((p) => `${p.symbol} ${p.orderRate}/min`)
+      .join(', ') || '-';
 
     const lines = [
       `📊 <b>Temple Bot</b> — ${upMin}m uptime${store.tradingHalted ? '  ⛔ HALTED' : ''}`,
       ``,
       `<b>Orders</b>  placed ${oc.placed} | pending ${oc.pending} | settling ${oc.settling} | settled ${c.ordersSettled}`,
-      `Volume ${c.volumeQuote.toFixed(2)} | 429 ${c.count429} | rate ${store.rate}/min`,
+      `Fill ${(fs.fillRate * 100).toFixed(0)}% (${fs.filled}) | cancel ${(fs.cancelRate * 100).toFixed(0)}% (${fs.cancelled})`,
+      `Avg settle ${avg !== undefined ? fmtDur(avg) : '-'} (pending→settled)`,
+      `Volume ${c.volumeQuote.toFixed(2)} | 429 ${c.count429} | order rate ${rates}`,
+      ``,
+      `<b>Deposit hari ini</b>  ${depToday}  (fee ${dep.todayCcFee.toFixed(2)} CC)`,
+      `<b>Deposit bulan ini</b>  ${depMonth}  (fee ${dep.monthCcFee.toFixed(2)} CC)`,
       ``,
       `<b>Temple (trading)</b>\n${temple || '  -'}`,
       ``,
@@ -119,4 +139,14 @@ export class TelegramNotifier {
   stop(): void {
     if (this.summaryTimer) clearInterval(this.summaryTimer);
   }
+}
+
+/** Human duration: 4s, 1m12s, 2h3m. */
+function fmtDur(ms: number): string {
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m${s % 60}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h${m % 60}m`;
 }

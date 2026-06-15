@@ -27,6 +27,14 @@ interface SymbolMeta {
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/**
+ * Safety margin added on top of the even spacing (60s / rate). Clock jitter and
+ * server-window misalignment mean firing at exactly 60s/rate can still land 2
+ * orders in the same server minute; +1s guarantees we stay strictly under the
+ * per-minute cap. e.g. 6/min → 10s+1s = 11s, 4/min → 15s+1s = 16s.
+ */
+const ORDER_SPACING_BUFFER_MS = 1000;
+
 /** Round to `decimals` places, biased up or down to a valid price tick. */
 function roundTo(n: number, decimals: number, dir: 'up' | 'down'): number {
   const f = 10 ** decimals;
@@ -59,6 +67,10 @@ export class PairWorker {
   private orderRate = 0;
   /** Ping-pong phase (alternates buy↔sell). Set from config in start(). */
   private phase: Side = 'buy';
+  /** Last side we logged (dedup the side-resolution note). */
+  private lastLoggedSide?: Side;
+  /** Last funding state we logged: 'fund' (placing) | 'wait' | 'drain'. */
+  private lastFundState?: string;
 
   constructor(
     private readonly sdk: TempleSdk,
@@ -117,13 +129,24 @@ export class PairWorker {
       return;
     }
     if (this.orderLimiter && this.orderRate === ordersPerMinute) return;
+    // Even spacing + a +1s safety buffer so we never exceed the per-minute cap.
+    const spacingMs = Math.ceil(60_000 / ordersPerMinute) + ORDER_SPACING_BUFFER_MS;
+    const spacingSec = (spacingMs / 1000).toFixed(0);
+    // Announce when the server-side per-symbol cap actually changes (re-checked
+    // every ~5 min via loadMeta) so an exchange-side change is visible + applied.
+    if (this.orderRate > 0 && this.orderRate !== ordersPerMinute) {
+      this.store.note(
+        'ratelimit',
+        `${this.pair.symbol}: limit order/menit berubah ${this.orderRate} → ${ordersPerMinute}, jeda order otomatis jadi ${spacingSec}s (60s/${ordersPerMinute}+1s), diterapkan`,
+      );
+    }
     this.orderRate = ordersPerMinute;
     this.orderLimiter = new RateLimiter({
       ratePerMinute: ordersPerMinute,
       maxRatePerMinute: ordersPerMinute, // hard cap — never place faster than allowed
-      minIntervalMs: Math.ceil(60_000 / ordersPerMinute),
+      minIntervalMs: spacingMs,
     });
-    this.store.patchPair(this.pair.symbol, { note: `order limit ${ordersPerMinute}/min` });
+    this.store.patchPair(this.pair.symbol, { note: `order limit ${ordersPerMinute}/min (jeda ${spacingSec}s)` });
   }
 
   private async loadMeta(): Promise<SymbolMeta> {
@@ -254,16 +277,42 @@ export class PairWorker {
     this.phase = side;
     this.store.patchPair(this.pair.symbol, { resolvedSide: side });
 
-    if ((await this.placeWhileFunded(side, meta)) > 0) return; // progress
+    // Readable side-resolution log (only when the chosen side changes).
+    if (this.lastLoggedSide !== side) {
+      this.lastLoggedSide = side;
+      const spend = side === 'buy' ? quote : base;
+      const hi = side === 'buy' ? quote : base;
+      const lo = side === 'buy' ? base : quote;
+      this.store.note(
+        `pair:${this.pair.symbol}`,
+        `saldo ${hi} $${(side === 'buy' ? usdQuote : usdBase).toFixed(2)} > ${lo} $${(side === 'buy' ? usdBase : usdQuote).toFixed(2)} → side ${side} (belanja ${spend})`,
+      );
+    }
+
+    if ((await this.placeWhileFunded(side, meta)) > 0) {
+      if (this.lastFundState !== 'fund') {
+        this.lastFundState = 'fund';
+        this.store.note(`pair:${this.pair.symbol}`, `saldo ${spendAsset(this.pair.symbol, side)} cukup → pasang order ${side}`);
+      }
+      return; // progress
+    }
 
     // Can't place. Wait while anything is still live (resting/pending/settling).
     const live = this.store.ordersForPair(this.pair.symbol).filter((o) => isLive(o.status)).length;
     if (live > 0) {
       this.store.patchPair(this.pair.symbol, { note: `${side}: waiting ${live} unsettled` });
+      if (this.lastFundState !== 'wait') {
+        this.lastFundState = 'wait';
+        this.store.note(`pair:${this.pair.symbol}`, `saldo ${spendAsset(this.pair.symbol, side)} habis, tunggu ${live} order settle dulu`);
+      }
       return;
     }
     // All settled + can't fund this side → refill from the wallet's largest-USD asset.
     this.store.patchPair(this.pair.symbol, { note: `${side} drained → deposit largest-USD wallet asset` });
+    if (this.lastFundState !== 'drain') {
+      this.lastFundState = 'drain';
+      this.store.note(`pair:${this.pair.symbol}`, `${side} terkuras & semua settle → minta deposit dari wallet`);
+    }
     await this.deposits.requestDeposit(this.pair.symbol);
   }
 

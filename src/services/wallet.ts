@@ -6,8 +6,8 @@ export interface Wallet {
   /** Loop SDK instance to pass as Temple's WALLET_ADAPTER. */
   loop: LoopSDK;
   partyId: string;
-  /** Pay any gas the ledger says is due (no-op when none). */
-  payDueGasIfAny(): Promise<void>;
+  /** Pay any gas the ledger says is due; returns the CC amount paid (0 when none). */
+  payDueGasIfAny(): Promise<number>;
 }
 
 /**
@@ -27,10 +27,14 @@ export async function initWallet(env: Env): Promise<Wallet> {
   return {
     loop,
     partyId: env.LOOP_PARTY_ID,
-    async payDueGasIfAny() {
+    async payDueGasIfAny(): Promise<number> {
       // PendingGasResponse: { pending, tracking_id?, gas_amount?, ... }
       const due = await loop.checkDueGas();
-      if (due?.pending && due.tracking_id) await loop.payGas(due.tracking_id);
+      if (due?.pending && due.tracking_id) {
+        await loop.payGas(due.tracking_id);
+        return Number(due.gas_amount) || 0;
+      }
+      return 0;
     },
   };
 }

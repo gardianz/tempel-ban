@@ -7,20 +7,32 @@ export type StoreEvent =
   | { type: 'order:updated'; order: TrackedOrder; prev: NormalizedStatus }
   | { type: 'order:settled'; order: TrackedOrder }
   | { type: 'order:cancelled'; order: TrackedOrder }
-  | { type: 'deposit'; asset: string; amount: number; ok: boolean }
+  | { type: 'deposit'; asset: string; amount: number; ok: boolean; ccFee?: number }
   | { type: 'pair'; symbol: string }
   | { type: 'rate'; rate: number; count429: number }
+  | { type: 'info'; scope: string; message: string }
   | { type: 'error'; scope: string; message: string };
 
 export interface Counters {
   volumeQuote: number;
   ordersPlaced: number;
   ordersSettled: number;
+  ordersCancelled: number;
   count429: number;
   startedAt: number;
 }
 
+/** One successful deposit, for today/this-month roll-ups. */
+export interface DepositRecord {
+  ts: number;
+  asset: string;
+  amount: number;
+  /** CC gas burned to make the deposit (0 when none was due). */
+  ccFee: number;
+}
+
 const RING = 200;
+const DEPOSIT_RING = 5000;
 
 /**
  * Single in-memory source of truth for dashboard + telegram. Mutating methods
@@ -35,9 +47,15 @@ export class Store extends EventEmitter {
     volumeQuote: 0,
     ordersPlaced: 0,
     ordersSettled: 0,
+    ordersCancelled: 0,
     count429: 0,
     startedAt: Date.now(),
   };
+  /** Running sum + count of pending→settled durations (for the average). */
+  private settleMsSum = 0;
+  private settleMsCount = 0;
+  /** Successful deposits (bounded ring) for today/this-month totals. */
+  private readonly deposits: DepositRecord[] = [];
   rate = 0;
   /** Server-advertised rate limit (x-ratelimit-limit) and remaining. */
   serverRateLimit?: number;
@@ -47,6 +65,8 @@ export class Store extends EventEmitter {
   /** Canton-coin rewards (volume-farming goal). */
   ccEarnedTotal?: number;
   ccEarned30d?: number;
+  /** 30d quote volume (from /api/rewards) — drives the per-order reward estimate. */
+  volume30d?: number;
   /** Oracle USD prices (lowercase keys: cbtc, cc, usdcx) for USD valuation. */
   oraclePrices: Record<string, number> = {};
   /** Live WebSocket top-of-book per symbol (real-time, no REST lag). */
@@ -102,6 +122,10 @@ export class Store extends EventEmitter {
    * session's order) — it does not count as newly placed nor log a PLACED event.
    */
   addOrder(order: TrackedOrder, adopted = false): void {
+    // An order adopted already-filled (pending/settling) starts its settle clock now.
+    if ((order.status === 'pending' || order.status === 'settling') && !order.pendingAt) {
+      order.pendingAt = order.placedAt;
+    }
     this.orders.set(order.requestId, order);
     if (adopted) return;
     this.pushLog(order);
@@ -124,12 +148,27 @@ export class Store extends EventEmitter {
     const prev = order.status;
     if (prev === status) return;
     order.status = status;
-    order.updatedAt = Date.now();
+    const now = Date.now();
+    order.updatedAt = now;
+
+    // First fill (placed → pending/settling) starts the settle clock.
+    if ((status === 'pending' || status === 'settling') && !order.pendingAt) {
+      order.pendingAt = now;
+    }
 
     if (status === 'settled') {
       // Terminal + fully settled → counts as volume.
+      const notional = order.price * order.quantity;
       this.counters.ordersSettled += 1;
-      this.counters.volumeQuote += order.price * order.quantity;
+      this.counters.volumeQuote += notional;
+      // Time from first fill to settled (fall back to placedAt if never seen pending).
+      order.settleMs = now - (order.pendingAt ?? order.placedAt);
+      this.settleMsSum += order.settleMs;
+      this.settleMsCount += 1;
+      // Estimated CC reward: this order's quote notional × (30d CC earned / 30d volume).
+      if (this.volume30d && this.volume30d > 0 && this.ccEarned30d) {
+        order.estRewardCc = notional * (this.ccEarned30d / this.volume30d);
+      }
       const p = this.pairs.get(order.symbol);
       if (p) p.ordersSettled += 1;
       this.orders.delete(requestId);
@@ -138,6 +177,7 @@ export class Store extends EventEmitter {
     }
     if (status === 'cancelled') {
       // Terminal, no fill → no volume.
+      this.counters.ordersCancelled += 1;
       this.orders.delete(requestId);
       this.emitEvent({ type: 'order:cancelled', order });
       return;
@@ -149,8 +189,12 @@ export class Store extends EventEmitter {
     this.updateOrderStatus(requestId, 'cancelled');
   }
 
-  recordDeposit(asset: string, amount: number, ok: boolean): void {
-    this.emitEvent({ type: 'deposit', asset, amount, ok });
+  recordDeposit(asset: string, amount: number, ok: boolean, ccFee = 0): void {
+    if (ok) {
+      this.deposits.push({ ts: Date.now(), asset, amount, ccFee });
+      if (this.deposits.length > DEPOSIT_RING) this.deposits.shift();
+    }
+    this.emitEvent({ type: 'deposit', asset, amount, ok, ccFee });
   }
 
   setRate(rate: number, count429: number): void {
@@ -159,8 +203,61 @@ export class Store extends EventEmitter {
     this.emitEvent({ type: 'rate', rate, count429 });
   }
 
+  /** Background activity log (informational — rendered normally, not as an error). */
+  note(scope: string, message: string): void {
+    this.emitEvent({ type: 'info', scope, message });
+  }
+
   recordError(scope: string, message: string): void {
     this.emitEvent({ type: 'error', scope, message });
+  }
+
+  /** Average pending→settled time (ms), or undefined when nothing settled yet. */
+  get avgSettleMs(): number | undefined {
+    return this.settleMsCount > 0 ? this.settleMsSum / this.settleMsCount : undefined;
+  }
+
+  /** Fill vs cancel split over all terminal orders this session (0..1). */
+  fillStats(): { filled: number; cancelled: number; fillRate: number; cancelRate: number } {
+    const filled = this.counters.ordersSettled;
+    const cancelled = this.counters.ordersCancelled;
+    const total = filled + cancelled;
+    return {
+      filled,
+      cancelled,
+      fillRate: total > 0 ? filled / total : 0,
+      cancelRate: total > 0 ? cancelled / total : 0,
+    };
+  }
+
+  /**
+   * Deposit + CC-fee totals for today and this calendar month (local time).
+   * `today`/`month` are per-asset deposited amounts; `*CcFee` is total CC gas burned.
+   */
+  depositTotals(): {
+    today: Record<string, number>;
+    month: Record<string, number>;
+    todayCcFee: number;
+    monthCcFee: number;
+  } {
+    const now = new Date();
+    const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+    const today: Record<string, number> = {};
+    const month: Record<string, number> = {};
+    let todayCcFee = 0;
+    let monthCcFee = 0;
+    for (const d of this.deposits) {
+      if (d.ts >= monthStart) {
+        month[d.asset] = (month[d.asset] ?? 0) + d.amount;
+        monthCcFee += d.ccFee;
+        if (d.ts >= dayStart) {
+          today[d.asset] = (today[d.asset] ?? 0) + d.amount;
+          todayCcFee += d.ccFee;
+        }
+      }
+    }
+    return { today, month, todayCcFee, monthCcFee };
   }
 
   ordersForPair(symbol: string): TrackedOrder[] {

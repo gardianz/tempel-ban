@@ -62,13 +62,18 @@ async function main(): Promise<void> {
   // Headless: no dashboard to render events, so log them to stdout.
   if (!dashboard) {
     store.on('event', (e: { type: string; [k: string]: unknown }) => {
-      const o = e.order as { side?: string; quantity?: number; symbol?: string; price?: number; orderId?: string; requestId?: string } | undefined;
+      const o = e.order as { side?: string; quantity?: number; symbol?: string; price?: number; orderId?: string; requestId?: string; settleMs?: number; estRewardCc?: number } | undefined;
       const id = o?.orderId ?? `req:${o?.requestId}`;
       if (e.type === 'order:placed') console.log(`PLACED ${o?.side} ${o?.quantity} ${o?.symbol} @ ${o?.price} (${id})`);
       else if (e.type === 'order:updated') console.log(`${String((e.order as { status?: string })?.status).toUpperCase()} ${o?.symbol} ${id}`);
-      else if (e.type === 'order:settled') console.log(`SETTLED ${o?.side} ${o?.symbol} @ ${o?.price} (${id})`);
+      else if (e.type === 'order:settled') {
+        const took = o?.settleMs !== undefined ? ` in ${Math.round(o.settleMs / 1000)}s` : '';
+        const rwd = o?.estRewardCc !== undefined ? ` ~${o.estRewardCc.toFixed(4)} CC` : '';
+        console.log(`SETTLED ${o?.side} ${o?.symbol} @ ${o?.price} (${id})${took}${rwd}`);
+      }
       else if (e.type === 'order:cancelled') console.log(`CANCELLED ${o?.symbol} ${id}`);
-      else if (e.type === 'deposit') console.log(`DEPOSIT ${e.amount} ${e.asset} ${e.ok ? 'ok' : 'FAIL'}`);
+      else if (e.type === 'deposit') console.log(`DEPOSIT ${e.amount} ${e.asset} ${e.ok ? 'ok' : 'FAIL'}${e.ccFee ? ` (gas ${e.ccFee} CC)` : ''}`);
+      else if (e.type === 'info') console.log(`» [${e.scope}] ${e.message}`);
       else if (e.type === 'error') console.log(`[${e.scope}] ${e.message}`);
       else if (e.type === 'rate') console.log(`rate=${e.rate}/min 429=${e.count429}`);
     });

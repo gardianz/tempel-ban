@@ -44,6 +44,9 @@ export class Orchestrator implements DepositManager {
   async start(): Promise<void> {
     // No wallet/proxy/onboarding here — trading needs only the API key. The
     // wallet (and proxy) come up lazily on the first deposit.
+    this.store.note('startup', `bot start — network ${this.store.network}, mode trading langsung (wallet menyusul saat deposit pertama)`);
+    const enabledPairs = this.config.pairs.filter((p) => p.enabled).map((p) => p.symbol);
+    this.store.note('startup', `pair aktif: ${enabledPairs.join(', ') || '(tidak ada)'}`);
     // Adopt any orders already open on the exchange (e.g. from a previous run)
     // BEFORE workers start, so they resume the right phase and wait for those
     // orders to settle instead of trading blind.
@@ -51,6 +54,20 @@ export class Orchestrator implements DepositManager {
     await this.loadProfile();
     try {
       this.store.oraclePrices = await this.sdk.getOracle(); // prime USD prices before trading
+      this.store.note('startup', 'harga oracle dimuat (untuk pilih side & nilai USD)');
+    } catch {
+      /* refreshed each reconcile */
+    }
+    // Show current Temple trading balances at boot (the funds we trade from).
+    try {
+      const detailed = await this.sdk.getTradingBalanceDetailed();
+      this.store.tradingDetailed = detailed;
+      this.store.tradingBalances = Object.fromEntries(Object.entries(detailed).map(([k, v]) => [k, v.unlocked]));
+      const summary = Object.entries(detailed)
+        .filter(([, v]) => v.unlocked + v.locked > 0)
+        .map(([k, v]) => `${k} ${(v.unlocked + v.locked).toFixed(4)}`)
+        .join(', ');
+      this.store.note('startup', `cek saldo Temple (trading): ${summary || 'kosong'}`);
     } catch {
       /* refreshed each reconcile */
     }
@@ -136,7 +153,7 @@ export class Orchestrator implements DepositManager {
       } catch {
         /* trades optional at startup */
       }
-      this.store.recordError('startup', `adopted ${placed} resting(placed) + ${unsettled} filled-unsettled order(s)`);
+      this.store.note('startup', `adopsi order lama: ${placed} resting + ${unsettled} terisi-belum-settle`);
     } catch (e) {
       this.store.recordError('startup', `adoptExistingOrders failed: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -159,12 +176,21 @@ export class Orchestrator implements DepositManager {
     if (this.wallet) return Promise.resolve(this.wallet);
     if (this.walletInit) return this.walletInit;
     this.walletInit = (async () => {
-      this.store.recordError('wallet', 'initializing Loop wallet + proxy for deposit…');
+      this.store.note('wallet', 'inisialisasi Loop wallet + proxy untuk deposit…');
       const { wallet, proxy } = await initWalletWithProxyRotation(this.env, this.env.PROXY_SCOPE);
       temple.setWalletAdapter(wallet.loop);
       this.wallet = wallet;
       this.store.walletParty = wallet.partyId;
-      this.store.recordError('wallet', `wallet ready (proxy ${proxy ? 'on' : 'off'})`);
+      this.store.note('wallet', `wallet siap (proxy ${proxy ? 'on' : 'off'})`);
+      // Show the Loop wallet balance the moment it comes up.
+      try {
+        const wb = await this.sdk.getWalletBalances(wallet.partyId);
+        this.store.walletBalances = wb;
+        const line = Object.entries(wb).filter(([, v]) => Number(v) > 0).map(([k, v]) => `${k} ${Number(v).toFixed(4)}`).join(', ');
+        this.store.note('wallet', `cek saldo wallet Loop: ${line || 'kosong'}`);
+      } catch {
+        /* non-fatal */
+      }
       // Ensure the delegation exists (one-time).
       const onboarded = await this.sdk.isOnboarded(wallet.partyId);
       if (!onboarded) {
@@ -325,11 +351,11 @@ export class Orchestrator implements DepositManager {
       this.store.maxLimitOrders = p.max_limit_orders;
       this.store.makerFees = p.maker_fees;
       this.store.takerFees = p.taker_fees;
-      this.store.recordError('profile', `max_limit_orders=${p.max_limit_orders} fees maker=${p.maker_fees} taker=${p.taker_fees}`);
+      this.store.note('profile', `max order limit=${p.max_limit_orders}, fee maker=${p.maker_fees} taker=${p.taker_fees}`);
     } catch {
       // getProfile isn't exposed on the api.* host (404). Non-fatal: "auto"
       // maxOpenOrders falls back to a sane default cap.
-      this.store.recordError('profile', 'profile unavailable on api host — auto order cap uses default (100)');
+      this.store.note('profile', 'profile tidak tersedia di api host — auto order cap pakai default (100)');
     }
   }
 
@@ -353,6 +379,7 @@ export class Orchestrator implements DepositManager {
         const r = await this.sdk.getRewards();
         this.store.ccEarnedTotal = r.rewards?.total_canton_coin_earned;
         this.store.ccEarned30d = r.rewards?.canton_coin_earned_30d;
+        this.store.volume30d = r.rewards?.volume_30d;
       } catch {
         /* ignore */
       }
@@ -447,9 +474,16 @@ export class Orchestrator implements DepositManager {
     }
 
     try {
-      await walletApi.payDueGasIfAny();
+      this.store.note('deposit', `deposit ${amount} ${asset} ($${bestUsd.toFixed(2)}) dari wallet → trading`);
+      const ccFee = await walletApi.payDueGasIfAny();
+      if (ccFee > 0) this.store.note('deposit', `bayar gas ledger ${ccFee} CC sebelum deposit`);
       await this.sdk.deposit(amount, asset);
-      this.store.recordDeposit(asset, amount, true);
+      this.store.recordDeposit(asset, amount, true, ccFee);
+      const t = this.store.depositTotals();
+      this.store.note(
+        'deposit',
+        `deposit ${asset} sukses. Hari ini ${(t.today[asset] ?? 0).toFixed(4)} ${asset} (fee ${t.todayCcFee.toFixed(2)} CC) | bulan ini ${(t.month[asset] ?? 0).toFixed(4)} ${asset} (fee ${t.monthCcFee.toFixed(2)} CC)`,
+      );
     } catch (e) {
       this.store.recordDeposit(asset, amount, false);
       this.store.recordError('deposit', e instanceof Error ? e.message : String(e));
