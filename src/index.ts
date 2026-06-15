@@ -32,21 +32,10 @@ async function main(): Promise<void> {
   });
   const sdk = new TempleSdk(limiter, { network: env.NETWORK, apiKey: env.TEMPLE_API_KEY });
 
-  // Observe the server's advertised rate limit (x-ratelimit-*) and adopt it so
-  // the limiter uses the REAL per-window budget instead of a guess.
-  let loggedLimit = false;
+  // React only to a real Retry-After (429). The x-ratelimit-limit/remaining
+  // headers are per-endpoint with an ambiguous window unit, so they aren't used
+  // to throttle — order pacing comes from rate_limit_orders_per_minute instead.
   installRateLimitObserver((info) => {
-    if (info.limit !== undefined) {
-      store.serverRateLimit = info.limit;
-      if (!loggedLimit) {
-        loggedLimit = true;
-        store.recordError('ratelimit', `server limit = ${info.limit}/window (x-ratelimit-limit)`);
-      }
-    }
-    if (info.remaining !== undefined) store.serverRateRemaining = info.remaining;
-    // Only react to a real Retry-After (429). Do NOT pause the shared read
-    // limiter on a low `remaining` — that header is per-endpoint and the order
-    // endpoint (capped 6/min) sits low, which would needlessly stall reads.
     if (info.retryAfter !== undefined) limiter.pauseFor(info.retryAfter * 1000);
   });
 

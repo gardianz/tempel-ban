@@ -54,14 +54,17 @@ export class Store extends EventEmitter {
   /** Running sum + count of pending→settled durations (for the average). */
   private settleMsSum = 0;
   private settleMsCount = 0;
+  /** Running sum + count of gaps between consecutive PLACED orders (actual pacing). */
+  private placedGapSumMs = 0;
+  private placedGapCount = 0;
+  private lastPlacedAt = 0;
   /** Successful deposits (bounded ring) for today/this-month totals. */
   private readonly deposits: DepositRecord[] = [];
   rate = 0;
-  /** Server-advertised rate limit (x-ratelimit-limit) and remaining. */
-  serverRateLimit?: number;
-  serverRateRemaining?: number;
   /** Global exchange health — true when killswitch/tradingPaused; workers idle. */
   tradingHalted = false;
+  /** User-initiated pause (Telegram /stop). Workers stop placing; process stays up. */
+  userPaused = false;
   /** Canton-coin rewards (volume-farming goal). */
   ccEarnedTotal?: number;
   ccEarned30d?: number;
@@ -128,6 +131,12 @@ export class Store extends EventEmitter {
     }
     this.orders.set(order.requestId, order);
     if (adopted) return;
+    // Measure the real gap between consecutive placements (vs the target spacing).
+    if (this.lastPlacedAt > 0) {
+      this.placedGapSumMs += order.placedAt - this.lastPlacedAt;
+      this.placedGapCount += 1;
+    }
+    this.lastPlacedAt = order.placedAt;
     this.pushLog(order);
     this.counters.ordersPlaced += 1;
     const p = this.pairs.get(order.symbol);
@@ -215,6 +224,11 @@ export class Store extends EventEmitter {
   /** Average pending→settled time (ms), or undefined when nothing settled yet. */
   get avgSettleMs(): number | undefined {
     return this.settleMsCount > 0 ? this.settleMsSum / this.settleMsCount : undefined;
+  }
+
+  /** Average actual gap between placed orders (ms), or undefined with <2 placed. */
+  get avgPlacedGapMs(): number | undefined {
+    return this.placedGapCount > 0 ? this.placedGapSumMs / this.placedGapCount : undefined;
   }
 
   /** Fill vs cancel split over all terminal orders this session (0..1). */

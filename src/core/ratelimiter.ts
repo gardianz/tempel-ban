@@ -102,20 +102,6 @@ export class RateLimiter {
     }
   }
 
-  /**
-   * Adopt the server's advertised limit (from x-ratelimit-limit). Caps maxRate
-   * and the current rate to it so we stop guessing and never exceed the real
-   * per-window budget. Conservative: treats the limit as per-minute.
-   */
-  adoptServerLimit(limit: number): void {
-    if (!Number.isFinite(limit) || limit <= 0) return;
-    this.maxRate = limit;
-    if (this.rate > limit) {
-      this.rate = limit;
-      if (this.tokens > limit) this.tokens = limit;
-    }
-  }
-
   /** Pause all acquires for `ms` (e.g. when the server says remaining is low). */
   pauseFor(ms: number): void {
     if (ms > 0) this.pausedUntil = Math.max(this.pausedUntil, this.now() + ms);

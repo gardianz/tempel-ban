@@ -13,7 +13,7 @@ export class Dashboard {
   private readonly header: any;
   private readonly pairsTable: any;
   private readonly logBox: any;
-  private readonly gauge: any;
+  private readonly pacingBox: any;
   private readonly statsBox: any;
   private readonly balanceBox: any;
   private readonly footer: any;
@@ -32,7 +32,7 @@ export class Dashboard {
       columnSpacing: 1,
       interactive: false,
     });
-    this.gauge = this.grid.set(2, 7, 2, 5, contrib.gauge, { label: ' Rate ' });
+    this.pacingBox = this.grid.set(2, 7, 2, 5, blessed.box, { tags: true, label: ' Order Pacing ' });
     this.statsBox = this.grid.set(4, 7, 3, 5, blessed.box, { tags: true, label: ' Orders & Rewards ' });
     this.logBox = this.grid.set(7, 0, 3, 12, contrib.log, { label: ' Order Log ', tags: true });
     this.balanceBox = this.grid.set(10, 0, 1, 12, blessed.box, { tags: true, label: ' Temple (unlocked/locked) ' });
@@ -107,15 +107,11 @@ export class Dashboard {
   private render(): void {
     const c = this.store.counters;
     const upMin = Math.floor(this.store.uptimeMs / 60_000);
-    const srvLimit =
-      this.store.serverRateLimit !== undefined
-        ? ` srv-limit=${this.store.serverRateLimit}(rem ${this.store.serverRateRemaining ?? '?'})`
-        : '';
     const reward = this.store.ccEarned30d !== undefined ? ` CC30d=${this.store.ccEarned30d.toFixed(2)}` : '';
     const halted = this.store.tradingHalted ? ' {red-fg}[HALTED]{/}' : '';
     this.header.setContent(
       `{bold}${this.botName}{/}  net=${this.store.network}  up=${upMin}m${halted}   ` +
-        `vol=${c.volumeQuote.toFixed(2)} placed=${c.ordersPlaced} settled=${c.ordersSettled} 429=${c.count429}${srvLimit}${reward}`,
+        `vol=${c.volumeQuote.toFixed(2)} placed=${c.ordersPlaced} settled=${c.ordersSettled} 429=${c.count429}${reward}`,
     );
 
     const rows: string[][] = [];
@@ -139,9 +135,20 @@ export class Dashboard {
       data: rows,
     });
 
-    // Rate gauge vs the server-advertised limit (fallback 60).
-    const ceil = this.store.serverRateLimit || 60;
-    this.gauge.setPercent(Math.min(100, Math.round((this.store.rate / ceil) * 100)));
+    // Order pacing: current per-symbol rate cap + target spacing, plus the
+    // measured average gap between placements (tells if the bot is delaying).
+    const pacing = [...this.store.pairs.values()]
+      .map((p) =>
+        p.orderRate
+          ? `${p.symbol}: ${p.orderRate}/min (jeda ${Math.ceil(60 / p.orderRate) + 1}s)`
+          : `${p.symbol}: tak dibatasi`,
+      )
+      .join('\n') || '-';
+    const avgGap = this.store.avgPlacedGapMs;
+    this.pacingBox.setContent(
+      `{bold}Rate limit/order{/}\n${pacing}\n` +
+        `{bold}Avg jeda placed{/}: ${avgGap !== undefined ? fmtDur(avgGap) : '-'}`,
+    );
 
     // Orders & rewards panel.
     const oc = this.store.orderCounts();

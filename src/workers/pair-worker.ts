@@ -220,6 +220,12 @@ export class PairWorker {
 
   private async tick(): Promise<void> {
     const meta = await this.loadMeta();
+    // User pause (Telegram /stop): stop placing new orders; let resting ones settle.
+    if (this.store.userPaused) {
+      this.store.patchPair(this.pair.symbol, { paused: true, note: 'dijeda user (Telegram /stop)' });
+      await sleep(this.backoffMs());
+      return;
+    }
     // Global health guard: stop placing while the exchange is paused/killswitched.
     if (this.store.tradingHalted) {
       this.store.patchPair(this.pair.symbol, { paused: true, note: 'exchange paused (killswitch/tradingPaused)' });

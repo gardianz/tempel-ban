@@ -14,6 +14,7 @@ export class TelegramNotifier {
   private readonly bot?: Bot;
   private readonly chatId?: string;
   private summaryTimer?: NodeJS.Timeout;
+  private store?: Store;
 
   constructor(env: Env) {
     if (env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID) {
@@ -26,15 +27,66 @@ export class TelegramNotifier {
     return Boolean(this.bot && this.chatId);
   }
 
-  /** Wire store events + start the periodic summary timer. */
+  /** Wire store events, register control commands, start the summary timer. */
   attach(store: Store, summaryIntervalMin: number): void {
     if (!this.enabled) return;
-    this.send('🤖 Temple bot started.');
+    this.store = store;
+    this.registerCommands();
+    this.send('🤖 Temple bot started. Kirim /help untuk daftar perintah.');
     store.on('event', (e: StoreEvent) => this.onEvent(e));
     // First snapshot after ~45s (balances/rewards populated), then periodic.
     setTimeout(() => this.sendSummary(store), 45_000).unref?.();
     this.summaryTimer = setInterval(() => this.sendSummary(store), summaryIntervalMin * 60_000);
     if (this.summaryTimer.unref) this.summaryTimer.unref();
+  }
+
+  /**
+   * Register Telegram command handlers and start long-polling. SECURITY: only
+   * the configured TELEGRAM_CHAT_ID may issue commands — this controls a
+   * real-money mainnet bot, so every other chat is silently ignored.
+   */
+  private registerCommands(): void {
+    const bot = this.bot;
+    if (!bot) return;
+
+    // Auth gate: drop any update not from the owner chat.
+    bot.use(async (ctx, next) => {
+      if (String(ctx.chat?.id) === this.chatId) await next();
+    });
+
+    bot.command('start', async (ctx) => {
+      if (this.store) this.store.userPaused = false;
+      await ctx.reply('▶️ Bot dijalankan. Order baru akan dipasang lagi.');
+    });
+    bot.command('stop', async (ctx) => {
+      if (this.store) this.store.userPaused = true;
+      await ctx.reply('⛔ Bot dijeda. Order baru berhenti; order lama dibiarkan settle.');
+    });
+    bot.command('stats', async (ctx) => {
+      await ctx.reply(this.store ? this.buildSummary(this.store) : 'store belum siap', { parse_mode: 'HTML' });
+    });
+    bot.command('status', async (ctx) => {
+      const s = this.store;
+      const state = !s ? '?' : s.userPaused ? '⛔ DIJEDA (user)' : s.tradingHalted ? '⛔ HALTED (exchange)' : '▶️ JALAN';
+      await ctx.reply(`Status: ${state}`);
+    });
+    bot.command('help', async (ctx) => {
+      await ctx.reply(
+        [
+          '<b>Perintah Temple Bot</b>',
+          '/start — jalankan bot (pasang order lagi)',
+          '/stop — jeda bot (stop order baru, order lama settle)',
+          '/status — status singkat (jalan/jeda/halted)',
+          '/stats — statistik lengkap (order, reward, limit/menit, deposit, saldo)',
+          '/help — bantuan ini',
+        ].join('\n'),
+        { parse_mode: 'HTML' },
+      );
+    });
+
+    bot.catch(() => {}); // never let a Telegram error crash the process
+    // Long-poll in the background; do not await (runs for the process lifetime).
+    bot.start({ drop_pending_updates: true }).catch(() => {});
   }
 
   private onEvent(e: StoreEvent): void {
@@ -85,13 +137,19 @@ export class TelegramNotifier {
     return lines.join('\n');
   }
 
-  /** Rich periodic snapshot: wallet, Temple balances, order status, rewards. */
+  /** Send the rich snapshot (used by the periodic timer). */
   private sendSummary(store: Store): void {
+    this.send(this.buildSummary(store));
+  }
+
+  /** Build the rich snapshot text: status, orders, pacing, deposits, balances, rewards. */
+  private buildSummary(store: Store): string {
     const c = store.counters;
     const px = store.oraclePrices;
     const upMin = Math.floor(store.uptimeMs / 60_000);
     const oc = store.orderCounts();
     const avg = store.avgSettleMs;
+    const avgGap = store.avgPlacedGapMs;
     const fs = store.fillStats();
     const dep = store.depositTotals();
 
@@ -109,14 +167,16 @@ export class TelegramNotifier {
       .filter((p) => p.orderRate)
       .map((p) => `${p.symbol} ${p.orderRate}/min`)
       .join(', ') || '-';
+    const state = store.userPaused ? '  ⛔ DIJEDA' : store.tradingHalted ? '  ⛔ HALTED' : '';
 
     const lines = [
-      `📊 <b>Temple Bot</b> — ${upMin}m uptime${store.tradingHalted ? '  ⛔ HALTED' : ''}`,
+      `📊 <b>Temple Bot</b> — ${upMin}m uptime${state}`,
       ``,
       `<b>Orders</b>  placed ${oc.placed} | pending ${oc.pending} | settling ${oc.settling} | settled ${c.ordersSettled}`,
       `Fill ${(fs.fillRate * 100).toFixed(0)}% (${fs.filled}) | cancel ${(fs.cancelRate * 100).toFixed(0)}% (${fs.cancelled})`,
       `Avg settle ${avg !== undefined ? fmtDur(avg) : '-'} (pending→settled)`,
       `Volume ${c.volumeQuote.toFixed(2)} | 429 ${c.count429} | order rate ${rates}`,
+      `Avg jeda placed ${avgGap !== undefined ? fmtDur(avgGap) : '-'}`,
       ``,
       `<b>Deposit hari ini</b>  ${depToday}  (fee ${dep.todayCcFee.toFixed(2)} CC)`,
       `<b>Deposit bulan ini</b>  ${depMonth}  (fee ${dep.monthCcFee.toFixed(2)} CC)`,
@@ -127,7 +187,7 @@ export class TelegramNotifier {
       ``,
       `<b>Rewards (CC)</b>  30d ${store.ccEarned30d?.toFixed(2) ?? '?'} | total ${store.ccEarnedTotal?.toFixed(2) ?? '?'}`,
     ];
-    this.send(lines.join('\n'));
+    return lines.join('\n');
   }
 
   private send(text: string): void {
@@ -138,6 +198,7 @@ export class TelegramNotifier {
 
   stop(): void {
     if (this.summaryTimer) clearInterval(this.summaryTimer);
+    void this.bot?.stop();
   }
 }
 

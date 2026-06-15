@@ -418,7 +418,7 @@ export class Orchestrator implements DepositManager {
    * depositing it funds the next side automatically.
    */
   private async maybeDeposit(symbol: string): Promise<void> {
-    if (this.stopped) return;
+    if (this.stopped || this.store.userPaused) return;
     const orders = this.store.ordersForPair(symbol);
     if (!shouldDeposit({ orders, remainingThresholdN: this.config.remainingThresholdN })) return;
 
