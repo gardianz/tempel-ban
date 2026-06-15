@@ -45,10 +45,6 @@ export const configSchema = z.object({
   walletReserve: z.record(z.string(), z.number().nonnegative()).default({}),
   /** Gas guard: stop ALL deposits when wallet CC falls below this (each deposit burns CC). Floored to the 10 CC fee reserve. */
   minWalletCc: z.number().nonnegative().default(10),
-  /** Keep resting orders within the top-N book levels; re-quote (cancel→replace at best) when they drift out. */
-  topOfBookLevels: z.number().int().positive().default(3),
-  /** Min order age (seconds) before the top-of-book drift check kicks in. */
-  requoteMinAgeSec: z.number().nonnegative().default(20),
   /**
    * Slippage buffer for `market` orders (fraction, e.g. 0.005 = 0.5%). The API
    * requires a price even for market orders and treats it as a worst-case fill

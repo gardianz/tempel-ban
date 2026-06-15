@@ -178,42 +178,29 @@ export class PairWorker {
   }
 
 
-  /** Cancel + drop any resting order past its TTL so it can be re-placed. */
+  /**
+   * Cancel + drop any resting order past its TTL so it can be re-placed at best.
+   * Only TTL drives re-quoting — orders also carry a server-side `expires_at`
+   * (TTL + 30s) as a backstop. (No off-top/drift re-quote: it churned cancels in
+   * a fast market and raced the server, producing a storm of 404s on already-gone
+   * orders.)
+   */
   private async requoteStale(): Promise<void> {
     const ttlMs = this.config.orderTtlMinutes * 60_000;
-    const minAgeMs = this.config.requoteMinAgeSec * 1000;
-    const live = this.store.liveBooks[this.pair.symbol];
-    const bookFresh = Boolean(live && Date.now() - live.ts < 5_000);
     const now = Date.now();
     for (const o of this.store.ordersForPair(this.pair.symbol)) {
       // Only resting orders are re-quotable.
       if (!isResting(o.status) || !o.orderId) continue;
       const ageMs = now - o.placedAt;
-
-      // Top-of-book drift: a resting order older than minAge that has fallen out
-      // of the top-N book levels gets cancelled and re-placed at the fresh best —
-      // keeps quotes glued to the top instead of drifting off as the market moves.
-      let drifted = false;
-      if (bookFresh && ageMs >= minAgeMs) {
-        const n = this.config.topOfBookLevels;
-        if (o.side === 'buy') {
-          const topBids = live!.bids.slice(0, n);
-          if (topBids.length > 0 && o.price < Math.min(...topBids)) drifted = true;
-        } else {
-          const topAsks = live!.asks.slice(0, n);
-          if (topAsks.length > 0 && o.price > Math.max(...topAsks)) drifted = true;
-        }
-      }
-
-      const ttlExpired = shouldRequote({ status: o.status, ageMs, ttlMs });
-      if (!drifted && !ttlExpired) continue;
+      if (!shouldRequote({ status: o.status, ageMs, ttlMs })) continue;
       try {
-        this.store.recordError('requote', `${o.side} @${o.price} ${drifted ? 'off-top' : 'TTL'} → re-quote at best`);
+        this.store.note('requote', `${o.side} @${o.price} TTL lewat → re-quote at best`);
         await this.sdk.cancelOrder(o.orderId);
         this.store.markCancelled(o.requestId);
       } catch (e) {
-        // settling/raced cancel — leave it; reconciler will catch up.
-        this.store.recordError(`requote:${this.pair.symbol}`, e instanceof Error ? e.message : String(e));
+        // 404/raced: the order already filled or expired server-side — leave it;
+        // the reconciler reads its real settlement from the trades feed.
+        this.store.note(`requote:${this.pair.symbol}`, `cancel dilewati (order sudah hilang/terisi): ${e instanceof Error ? e.message : String(e)}`);
       }
     }
   }
