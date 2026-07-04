@@ -228,13 +228,29 @@ export class Orchestrator implements DepositManager {
 
   private subscribeUserOrders(): void {
     this.wsUnsub = temple.subscribeUserOrders((data: unknown) => {
-      const o = data as { order_id?: string; request_id?: string | number; status?: string };
+      const o = data as {
+        order_id?: string;
+        request_id?: string | number;
+        status?: string;
+        quantity?: string | number; // REMAINING (string on the wire, e.g. "0")
+        original_quantity?: string | number;
+      };
       if (!o.status) return;
       // Prefer request_id (our tracking key). Fall back to order_id -> request_id.
       let requestId: string | undefined =
         o.request_id !== undefined ? String(o.request_id) : undefined;
       if (!requestId && o.order_id) requestId = this.store.findRequestIdByOrderId(String(o.order_id));
-      if (requestId) this.applyStatus(requestId, o.status);
+      if (!requestId) return;
+      // Real-time filled qty (original − remaining) straight off the WS push, so
+      // the per-order fill bar updates immediately instead of waiting up to
+      // pollIntervalSec for the reconcile (which caused filled orders to sit at
+      // 0% / partial fills to look "stuck"). Set BEFORE applyStatus so a WS-driven
+      // settle also books volume against the real filled amount.
+      if (o.original_quantity !== undefined && o.quantity !== undefined) {
+        const tracked = this.store.orders.get(requestId);
+        if (tracked) tracked.filledQuantity = Math.max(0, num(o.original_quantity) - num(o.quantity));
+      }
+      this.applyStatus(requestId, o.status);
     });
   }
 
