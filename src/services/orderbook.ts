@@ -5,6 +5,11 @@ const num = (v: unknown): number => {
   return typeof n === 'number' && !Number.isNaN(n) ? n : 0;
 };
 
+export interface BookLevel {
+  price: number;
+  qty: number;
+}
+
 export interface BookTop {
   bestBid?: number;
   bestAsk?: number;
@@ -12,6 +17,10 @@ export interface BookTop {
   bids: number[];
   /** Top-N ask prices, lowest first. */
   asks: number[];
+  /** Top-N bid levels (price+size), highest first — for the depth ladder. */
+  bidLevels: BookLevel[];
+  /** Top-N ask levels (price+size), lowest first. */
+  askLevels: BookLevel[];
   ts: number;
 }
 
@@ -27,7 +36,7 @@ export class LiveOrderbook {
   private readonly bids = new Map<number, number>(); // price -> quantity
   private readonly asks = new Map<number, number>();
   private readonly unsub: () => void;
-  readonly top: BookTop = { ts: 0, bids: [], asks: [] };
+  readonly top: BookTop = { ts: 0, bids: [], asks: [], bidLevels: [], askLevels: [] };
 
   constructor(symbol: string, private readonly onUpdate?: (top: BookTop) => void) {
     this.unsub = subscribeOrderbook(symbol, (d: unknown) => this.apply(d as Record<string, unknown>));
@@ -66,6 +75,8 @@ export class LiveOrderbook {
     const asks = [...this.asks.keys()].filter((p) => p > 0).sort((a, b) => a - b).slice(0, TOP_N);
     this.top.bids = bids;
     this.top.asks = asks;
+    this.top.bidLevels = bids.map((price) => ({ price, qty: this.bids.get(price) ?? 0 }));
+    this.top.askLevels = asks.map((price) => ({ price, qty: this.asks.get(price) ?? 0 }));
     this.top.bestBid = bids[0];
     this.top.bestAsk = asks[0];
     this.top.ts = Date.now();

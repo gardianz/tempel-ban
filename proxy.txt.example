@@ -1,0 +1,14 @@
+# Proxy pool — one proxy URL per line. Copy to `proxy.txt` and fill in.
+# Used ONLY for the Loop/Cantonloop wallet auth + deposit path (datacenter IPs
+# get 403 there). Trading (orders/balances) runs direct, no proxy.
+#
+# The bot tries each proxy in turn until one authenticates, so list several
+# residential proxies for reliability. Blank lines and `#` comments are ignored.
+#
+# NEVER commit proxy.txt — it holds credentials and this repo is public.
+#
+# Format: scheme://user:pass@host:port   (http/https/socks5 supported by undici)
+#
+# http://user:pass@residential1.example.com:8080
+# http://user:pass@residential2.example.com:8080
+# socks5://user:pass@residential3.example.com:1080

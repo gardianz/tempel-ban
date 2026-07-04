@@ -79,6 +79,17 @@ export class Store extends EventEmitter {
   tradingHalted = false;
   /** User-initiated pause (Telegram /stop). Workers stop placing; process stays up. */
   userPaused = false;
+  /**
+   * Per-symbol rate-limit cooldown deadline (ms epoch). Set when the exchange
+   * throttles order placement (429/249); the worker's order limiter is paused
+   * until then, and the dashboard shows a countdown badge.
+   */
+  readonly cooldownUntil: Record<string, number> = {};
+  /** Total cooldown that was armed per symbol (for the progress-bar denominator). */
+  readonly cooldownTotalMs: Record<string, number> = {};
+  /** Configured pacing (for display): batch spacing + post-429 cooldown, ms. */
+  orderSpacingMs = 2000;
+  rateLimitCooldownMs = 30_000;
   /** Canton-coin rewards (volume-farming goal). */
   ccEarnedTotal?: number;
   ccEarned30d?: number;
@@ -87,7 +98,15 @@ export class Store extends EventEmitter {
   /** Oracle USD prices (lowercase keys: cbtc, cc, usdcx) for USD valuation. */
   oraclePrices: Record<string, number> = {};
   /** Live WebSocket top-of-book per symbol (real-time, no REST lag). */
-  liveBooks: Record<string, { bestBid?: number; bestAsk?: number; bids: number[]; asks: number[]; ts: number }> = {};
+  liveBooks: Record<string, {
+    bestBid?: number;
+    bestAsk?: number;
+    bids: number[];
+    asks: number[];
+    bidLevels?: { price: number; qty: number }[];
+    askLevels?: { price: number; qty: number }[];
+    ts: number;
+  }> = {};
   /** Account order-count cap (max_limit_orders) for "auto" sizing. */
   maxLimitOrders?: number;
   makerFees?: number;
@@ -180,8 +199,10 @@ export class Store extends EventEmitter {
     }
 
     if (status === 'settled') {
-      // Terminal + fully settled → counts as volume.
-      const notional = order.price * order.quantity;
+      // Terminal + fully settled → counts as volume. Use the ACTUALLY-filled qty
+      // (from by-request) when known so partial fills don't over-count.
+      const filledQty = order.filledQuantity ?? order.quantity;
+      const notional = order.price * filledQty;
       this.counters.ordersSettled += 1;
       this.counters.volumeQuote += notional;
       // Time from first fill to settled (fall back to placedAt if never seen pending).
@@ -229,6 +250,25 @@ export class Store extends EventEmitter {
   /** Background activity log (informational — rendered normally, not as an error). */
   note(scope: string, message: string): void {
     this.emitEvent({ type: 'info', scope, message });
+  }
+
+  /** Mark a symbol as rate-limited: block new orders for `ms` (dashboard badge). */
+  setCooldown(symbol: string, ms: number): void {
+    this.cooldownUntil[symbol] = Date.now() + ms;
+    this.cooldownTotalMs[symbol] = ms;
+  }
+
+  /** Remaining cooldown for a symbol in ms (0 when not rate-limited). */
+  cooldownMsLeft(symbol: string): number {
+    return Math.max(0, (this.cooldownUntil[symbol] ?? 0) - Date.now());
+  }
+
+  /** How many orders were PLACED in the trailing `ms` window (order-rate gauge). */
+  placedLastMs(ms: number): number {
+    const cutoff = Date.now() - ms;
+    let n = 0;
+    for (const o of this.log) if (o.placedAt >= cutoff) n++;
+    return n;
   }
 
   recordError(scope: string, message: string): void {

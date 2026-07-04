@@ -43,7 +43,9 @@ cp .env.example .env   # then fill it in
 | `LOOP_PRIVATE_KEY` | ✅ | Loop wallet key (Ed25519, server-mode signing — deposits). |
 | `LOOP_PARTY_ID` | ✅ | Canton party id. |
 | `NETWORK` | ✅ | `mainnet` or `testnet`. |
-| `PROXY_LIST` | for deposits | Comma/newline-separated residential proxy pool. |
+| `proxy.txt` (file) | for deposits | Easiest proxy setup: one proxy URL per line (copy `proxy.txt.example`). Gitignored. |
+| `PROXY_FILE` | optional | Override the default `proxy.txt` path. |
+| `PROXY_URL` / `PROXY_LIST` | optional | Single proxy / comma-newline pool (merged with `proxy.txt`). |
 | `PROXY_SCOPE` | optional | `wallet` (default — proxy only the wallet/deposit path) or `all`. |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | optional | Omit to disable notifications. |
 

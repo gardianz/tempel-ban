@@ -15,6 +15,7 @@ export class TelegramNotifier {
   private readonly chatId?: string;
   private summaryTimer?: NodeJS.Timeout;
   private store?: Store;
+  private onWithdraw?: (asset: string, amount: number) => Promise<string>;
 
   constructor(env: Env) {
     if (env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID) {
@@ -28,9 +29,14 @@ export class TelegramNotifier {
   }
 
   /** Wire store events, register control commands, start the summary timer. */
-  attach(store: Store, summaryIntervalMin: number): void {
+  attach(
+    store: Store,
+    summaryIntervalMin: number,
+    onWithdraw?: (asset: string, amount: number) => Promise<string>,
+  ): void {
     if (!this.enabled) return;
     this.store = store;
+    this.onWithdraw = onWithdraw;
     this.registerCommands();
     this.send('🤖 Temple bot started. Kirim /help untuk daftar perintah.');
     store.on('event', (e: StoreEvent) => this.onEvent(e));
@@ -70,6 +76,31 @@ export class TelegramNotifier {
       const state = !s ? '?' : s.userPaused ? '⛔ DIJEDA (user)' : s.tradingHalted ? '⛔ HALTED (exchange)' : '▶️ JALAN';
       await ctx.reply(`Status: ${state}`);
     });
+    bot.command('cooldown', async (ctx) => {
+      const sec = Number(String(ctx.match ?? '').trim());
+      if (this.store && Number.isFinite(sec) && sec > 0) {
+        this.store.rateLimitCooldownMs = Math.round(sec * 1000);
+        await ctx.reply(`✔ cooldown rate-limit = ${sec}s (berlaku untuk 429 berikutnya)`);
+      } else {
+        await ctx.reply('pakai: /cooldown <detik>  (mis. /cooldown 45)');
+      }
+    });
+    bot.command('withdraw', async (ctx) => {
+      const parts = String(ctx.match ?? '').trim().split(/\s+/);
+      const asset = (parts[0] ?? '').toUpperCase();
+      const amt = Number(parts[1]);
+      if (!asset || !Number.isFinite(amt) || amt <= 0) {
+        await ctx.reply('pakai: /withdraw <ASET> <jumlah>  (mis. /withdraw USDA 100)');
+        return;
+      }
+      if (!this.onWithdraw) {
+        await ctx.reply('withdraw tak tersedia');
+        return;
+      }
+      await ctx.reply(`⧗ withdraw ${amt} ${asset} diproses…`);
+      const r = await this.onWithdraw(asset, amt).catch((e) => `withdraw error: ${e instanceof Error ? e.message : String(e)}`);
+      await ctx.reply(r);
+    });
     bot.command('help', async (ctx) => {
       await ctx.reply(
         [
@@ -78,6 +109,8 @@ export class TelegramNotifier {
           '/stop — jeda bot (stop order baru, order lama settle)',
           '/status — status singkat (jalan/jeda/halted)',
           '/stats — statistik lengkap (order, reward, limit/menit, deposit, saldo)',
+          '/cooldown &lt;detik&gt; — ubah cooldown saat kena rate-limit (mis. /cooldown 45)',
+          '/withdraw &lt;ASET&gt; &lt;jumlah&gt; — tarik dana dari trading ke wallet (mis. /withdraw USDA 100)',
           '/help — bantuan ini',
         ].join('\n'),
         { parse_mode: 'HTML' },

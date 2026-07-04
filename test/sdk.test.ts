@@ -36,6 +36,22 @@ describe('error-as-value handling', () => {
     await expect(sdk.getActiveOrders()).rejects.toMatchObject({ is429: true });
     expect(rl.currentRate).toBe(Math.floor(before * 0.5));
   });
+
+  it('treats code 249 as rate-limited and backs the limiter off', async () => {
+    const { sdk, rl } = makeSdk();
+    mock.getActiveOrders.mockResolvedValue({ error: true, status: 249, code: 249, message: 'rate limit' });
+    const before = rl.currentRate;
+    await expect(sdk.getActiveOrders()).rejects.toMatchObject({ isRateLimited: true, is429: false });
+    expect(rl.currentRate).toBe(Math.floor(before * 0.5));
+  });
+
+  it('does NOT treat an ordinary 400 as rate-limited', async () => {
+    const { sdk, rl } = makeSdk();
+    mock.getActiveOrders.mockResolvedValue({ error: true, status: 400, code: 'BAD', message: 'bad request' });
+    const before = rl.currentRate;
+    await expect(sdk.getActiveOrders()).rejects.toMatchObject({ isRateLimited: false });
+    expect(rl.currentRate).toBe(before); // untouched
+  });
 });
 
 describe('placeLimit', () => {

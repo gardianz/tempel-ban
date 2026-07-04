@@ -16,6 +16,19 @@ export class TempleApiError extends Error {
   get is429(): boolean {
     return this.status === 429;
   }
+
+  /**
+   * True for ANY rate-limit signal, not just HTTP 429. Temple has also been seen
+   * to surface the throttle as code/status 249, so match both numbers on the
+   * status AND the body code, plus a message fallback ("rate limit"/"too many").
+   * The order path uses this to trigger a fixed cooldown before submitting again.
+   */
+  get isRateLimited(): boolean {
+    if (this.status === 429 || this.status === 249) return true;
+    if (this.code === 429 || this.code === 249 || this.code === '429' || this.code === '249') return true;
+    const m = (this.message ?? '').toLowerCase();
+    return m.includes('rate limit') || m.includes('too many') || m.includes('429') || m.includes('249');
+  }
 }
 
 function toTempleError(e: unknown): TempleApiError {
@@ -55,6 +68,21 @@ export interface TradeRow {
   created_at?: string;
 }
 
+/** One order row from the by-request lookup (authoritative order status). */
+export interface OrderRow {
+  orderId?: string;
+  requestId?: string;
+  symbol?: string;
+  side?: string;
+  status?: string;
+  price?: number;
+  /** Remaining (unfilled) quantity. */
+  quantity?: number;
+  /** Original order quantity (remaining < original ⇒ partial fill). */
+  originalQuantity?: number;
+  createdAt?: string;
+}
+
 function num(v: unknown): number | undefined {
   const n = typeof v === 'string' ? Number(v) : (v as number);
   return typeof n === 'number' && !Number.isNaN(n) ? n : undefined;
@@ -76,7 +104,14 @@ export class TempleSdk {
   }
   private readonly apiKey: string;
 
-  private async call<T>(fn: () => Promise<T>): Promise<T> {
+  /**
+   * @param feedRateLimit when false, a 429 does NOT back off the shared request
+   *   limiter. Set for ORDER creation: its 429 is the account's per-minute ORDER
+   *   cap (handled by the order-path cooldown), NOT a general request-rate
+   *   problem — feeding it here wrongly halves the shared read rate and chokes
+   *   reconcile/balance/book reads to a crawl after a couple of order 429s.
+   */
+  private async call<T>(fn: () => Promise<T>, feedRateLimit = true): Promise<T> {
     await this.rl.acquire();
     let out: T;
     try {
@@ -88,10 +123,10 @@ export class TempleSdk {
     }
     // SDK signals failure by resolving with { error:true, status, code, message }.
     if (isSdkError(out)) {
-      if (out.status === 429) {
-        this.rl.on429(retryAfterMs(out));
-      }
-      throw new TempleApiError(out.message, out.status ?? undefined, out.code ?? undefined, out);
+      const err = new TempleApiError(out.message, out.status ?? undefined, out.code ?? undefined, out);
+      // Back the shared limiter off on a general rate-limit signal only.
+      if (err.isRateLimited && feedRateLimit) this.rl.on429(retryAfterMs(out));
+      throw err;
     }
     this.rl.onSuccess();
     return out;
@@ -113,6 +148,50 @@ export class TempleSdk {
       if (!res.ok) return { error: true, status: res.status, code: null, message: `${path} HTTP ${res.status}` } as never;
       return (await res.json()) as never;
     });
+  }
+
+  /** Direct authenticated POST against the trading host (X-API-Key, no proxy). */
+  private postJson<T>(path: string, body: unknown): Promise<T> {
+    return this.call(async () => {
+      const res = await fetch(`${this.apiBase}${path}`, {
+        method: 'POST',
+        headers: { 'X-API-Key': this.apiKey, Accept: 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) return { error: true, status: res.status, code: null, message: `${path} HTTP ${res.status}` } as never;
+      return (await res.json()) as never;
+    });
+  }
+
+  /**
+   * Authoritative order status for our tracked request_ids (POST
+   * /api/trading/orders/by-request). Returns each order's real order_id, status
+   * (open/partially_filled/filled/canceled/expired) and remaining vs original
+   * quantity — replaces the fragile "match a trade by side+price+ts" heuristic.
+   */
+  async getOrdersByRequestIds(requestIds: (string | number)[]): Promise<{ active: OrderRow[]; inactive: OrderRow[] }> {
+    if (requestIds.length === 0) return { active: [], inactive: [] };
+    const ids = requestIds.map((x) => Number(x)).filter((n) => Number.isFinite(n));
+    const res = await this.postJson<{ active_orders?: unknown[]; inactive_orders?: unknown[] }>(
+      '/api/trading/orders/by-request',
+      { request_ids: ids },
+    );
+    const map = (arr: unknown[] | undefined): OrderRow[] =>
+      (arr ?? []).map((raw) => {
+        const o = raw as Record<string, unknown>;
+        return {
+          orderId: o.order_id != null ? String(o.order_id) : undefined,
+          requestId: o.request_id != null ? String(o.request_id) : undefined,
+          symbol: o.symbol as string | undefined,
+          side: typeof o.side === 'string' ? o.side.toLowerCase() : undefined,
+          status: typeof o.status === 'string' ? o.status.toLowerCase() : undefined,
+          price: num(o.price),
+          quantity: num(o.quantity),
+          originalQuantity: num(o.original_quantity),
+          createdAt: o.created_at as string | undefined,
+        };
+      });
+    return { active: map(res?.active_orders), inactive: map(res?.inactive_orders) };
   }
 
   async getSymbolConfig(symbol: string): Promise<{
@@ -181,16 +260,18 @@ export class TempleSdk {
     const orderType = opts.orderType ?? 'limit';
     // post_only is a maker-only guarantee — incompatible with a market (taker) order.
     const postOnly = orderType === 'market' ? false : opts.postOnly;
-    const res = await this.call(() =>
-      temple.createOrderRequest({
-        symbol: opts.symbol,
-        side: opts.side,
-        quantity: opts.quantity,
-        price: opts.price,
-        order_type: orderType,
-        ...(postOnly ? { order_subtype: 'post_only' } : {}),
-        ...(opts.expiresAt ? { expires_at: opts.expiresAt } : {}),
-      }),
+    const res = await this.call(
+      () =>
+        temple.createOrderRequest({
+          symbol: opts.symbol,
+          side: opts.side,
+          quantity: opts.quantity,
+          price: opts.price,
+          order_type: orderType,
+          ...(postOnly ? { order_subtype: 'post_only' } : {}),
+          ...(opts.expiresAt ? { expires_at: opts.expiresAt } : {}),
+        }),
+      false, // order 429 = account order cap → handled by cooldown, don't throttle reads
     );
     const reqId = res?.request_id ?? res?.requestId;
     if (reqId === undefined || reqId === null) {
@@ -258,6 +339,17 @@ export class TempleSdk {
 
   async deposit(amount: number, symbol: string) {
     return this.call(() => temple.deposit(amount, symbol));
+  }
+
+  /**
+   * Withdraw an asset from the trading balance back to the Loop wallet. Uses the
+   * SDK's high-level flow (create request → poll status → exercise
+   * Allocation_Withdraw on the ledger to release holdings). Needs the wallet
+   * adapter set (like deposit) — route through the orchestrator's wallet path.
+   * Only unlocked balance can be withdrawn; one in-flight withdrawal per asset.
+   */
+  async withdraw(assetId: string, amount: number | string) {
+    return this.call(() => temple.withdrawFunds({ asset_id: assetId, amount: String(amount) }));
   }
 
   async isOnboarded(party: string): Promise<boolean> {

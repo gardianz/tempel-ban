@@ -1,5 +1,5 @@
 import * as temple from '@temple-digital-group/temple-canton-js';
-import type { TempleSdk } from '../services/sdk.js';
+import type { TempleSdk, OrderRow } from '../services/sdk.js';
 import { initWalletWithProxyRotation, type Wallet } from '../services/wallet.js';
 import { LiveOrderbook } from '../services/orderbook.js';
 import type { Store } from '../state/store.js';
@@ -11,6 +11,16 @@ import { floorToDecimals } from '../core/order-sizer.js';
 import { splitPair, usdValue, type Side, type TrackedOrder } from '../types.js';
 
 const CC_FEE_RESERVE = 10; // SDK always keeps 10 CC for gas.
+
+/**
+ * After a successful deposit, block another deposit for the SAME pair for this
+ * long. A just-deposited amount takes a few seconds to reflect as `unlocked` in
+ * the trading balance; without this guard the next tick still sees an empty
+ * balance, can't place, drops to 0 live orders, and re-triggers a deposit — which
+ * (the wallet's largest asset already gone) deposits the NEXT-largest asset too.
+ * The cooldown ensures ONE deposit (the largest asset) per refill cycle.
+ */
+const DEPOSIT_COOLDOWN_MS = 60_000;
 
 const num = (v: unknown): number => {
   const n = typeof v === 'string' ? Number(v) : (v as number);
@@ -26,6 +36,10 @@ const num = (v: unknown): number => {
 export class Orchestrator implements DepositManager {
   private readonly workers: PairWorker[] = [];
   private depositChain: Promise<void> = Promise.resolve();
+  /** Per-pair timestamp of the last SUCCESSFUL deposit (drives the cooldown). */
+  private readonly lastDepositAt = new Map<string, number>();
+  /** Per-pair last cooldown deadline we already logged (dedupes the skip note). */
+  private readonly cooldownNotedFor = new Map<string, number>();
   private reconcileTimer?: NodeJS.Timeout;
   private wsUnsub?: () => void;
   private readonly liveBooks: LiveOrderbook[] = [];
@@ -81,7 +95,15 @@ export class Orchestrator implements DepositManager {
       if (!pair.enabled) continue;
       // Live WS top-of-book → real-time best bid/ask (no REST polling lag).
       const lob = new LiveOrderbook(pair.symbol, (top) => {
-        this.store.liveBooks[pair.symbol] = { bestBid: top.bestBid, bestAsk: top.bestAsk, bids: top.bids, asks: top.asks, ts: top.ts };
+        this.store.liveBooks[pair.symbol] = {
+          bestBid: top.bestBid,
+          bestAsk: top.bestAsk,
+          bids: top.bids,
+          asks: top.asks,
+          bidLevels: top.bidLevels,
+          askLevels: top.askLevels,
+          ts: top.ts,
+        };
       });
       this.liveBooks.push(lob);
       const w = new PairWorker(this.sdk, this.store, this.config, pair, this);
@@ -230,104 +252,77 @@ export class Orchestrator implements DepositManager {
   }
 
   /**
-   * Re-derive every tracked order's status from two authoritative sources each
-   * tick (no fragile "gone from book = settling" guess that breaks on a transient
-   * getActiveOrders miss):
-   *   - in the ACTIVE book          → pending (still resting)
-   *   - has a TRADE (proof of fill) → settling, or settled when ALL its trades settle
-   *   - not active, no trade, past TTL+grace → expired/cancelled → settled
-   * Matches the reference bot: fills come from /api/trading/trades, not absence.
+   * Re-derive every tracked order's status from the AUTHORITATIVE by-request
+   * lookup (POST /orders/by-request), no longer from a fragile "gone from book +
+   * match a trade by side/price/ts" heuristic:
+   *   - active (open/partially_filled) → placed (resolves its real order_id)
+   *   - inactive canceled/expired      → cancelled (no 2-minute grace guessing)
+   *   - inactive filled                → settlement bucket from that order's trades
+   * The trades feed is used ONLY for the pending→settling→settled progression of
+   * filled orders (order status doesn't expose settlement). Adopted `t:` fills
+   * (no request_id) still settle via their trades.
    */
   private async reconcile(): Promise<void> {
     if (this.stopped) return;
     try {
-      const active = await this.sdk.getActiveOrders();
-      const activeReqIds = new Set<string>();
-      for (const a of active) {
-        const reqId = a.request_id !== undefined ? String(a.request_id) : undefined;
-        const orderId = a.order_id ? String(a.order_id) : undefined;
-        if (!reqId) {
-          if (orderId) this.warnNoRequestId(orderId);
-          continue;
+      const tracked = [...this.store.orders.values()];
+
+      // 1. Authoritative order status for our tracked request_ids (numeric only;
+      //    synthetic adopted `t:oid` keys have no request_id → trades path below).
+      const numericIds = tracked.map((o) => o.requestId).filter((id) => /^\d+$/.test(id));
+      const byReq = new Map<string, OrderRow>();
+      if (numericIds.length > 0) {
+        try {
+          const { active, inactive } = await this.sdk.getOrdersByRequestIds(numericIds);
+          for (const r of [...active, ...inactive]) if (r.requestId) byReq.set(r.requestId, r);
+        } catch (e) {
+          this.store.recordError('reconcile', `by-request failed: ${e instanceof Error ? e.message : String(e)}`);
         }
-        activeReqIds.add(reqId);
-        if (orderId) this.store.resolveOrderId(reqId, orderId);
       }
 
-      // Trades index. CRITICAL: order_id match is exact (a trade belongs to one
-      // order); the side+price FALLBACK must also require the trade to be NEWER
-      // than the order — otherwise it matches ancient trades at the same price
-      // (there are tens of thousands) and false-settles everything (worse on
-      // restart). Same guard as the reference bot (trade_ts >= placed_at - 5s).
-      type TInfo = { status: string; qty: number; ts: number; side: string; price: number; orderId?: string };
+      // 2. Trades index (order_id -> trade statuses) for the settlement progression.
       let trades: Awaited<ReturnType<TempleSdk['getRecentUserTrades']>> = [];
       try {
         trades = await this.sdk.getRecentUserTrades(150);
       } catch (e) {
         this.store.recordError('trades', e instanceof Error ? e.message : String(e));
       }
-      const tinfos: (TInfo & { side: string; price: number; orderId?: string })[] = trades.map((t) => ({
-        status: (t.status ?? '').toLowerCase(),
-        qty: num(t.quantity),
-        ts: t.created_at ? Date.parse(t.created_at) : 0,
-        side: (t.side ?? '').toLowerCase(),
-        price: num(t.price),
-        orderId: t.order_id,
-      }));
-      const byOrderId = new Map<string, TInfo[]>();
-      for (const t of tinfos) {
-        if (!t.orderId) continue;
-        let arr = byOrderId.get(t.orderId);
-        if (!arr) byOrderId.set(t.orderId, (arr = []));
-        arr.push(t);
+      const tradesByOrderId = new Map<string, string[]>();
+      for (const t of trades) {
+        if (!t.order_id) continue;
+        let arr = tradesByOrderId.get(t.order_id);
+        if (!arr) tradesByOrderId.set(t.order_id, (arr = []));
+        arr.push((t.status ?? '').toLowerCase());
       }
-      // order_ids already owned by a tracked order — never claim these for another.
-      const claimed = new Set<string>();
-      for (const o of this.store.orders.values()) if (o.orderId) claimed.add(o.orderId);
 
-      // 1:1 claim: assign an unclaimed trade's order_id to a tracked order without
-      // one, matched by side + price + (trade newer than the order). Fixes the
-      // shared-price ambiguity that previously mis-labelled FILLS as cancelled.
-      const claimOrderId = (o: { side: string; price: number; placedAt: number }): string | undefined => {
-        for (const [oid, list] of byOrderId) {
-          if (claimed.has(oid)) continue;
-          const t = list[0];
-          if (!t) continue;
-          if (t.side === o.side && Math.abs(t.price - o.price) <= Math.max(o.price * 1e-4, 1e-8) && t.ts >= o.placedAt - 5_000) {
-            claimed.add(oid);
-            return oid;
+      for (const o of tracked) {
+        const row = byReq.get(o.requestId);
+        if (row) {
+          if (row.orderId) this.store.resolveOrderId(o.requestId, row.orderId);
+          // Track the actually-filled base qty (original − remaining) for accurate
+          // volume — partial fills would otherwise count the full order size.
+          if (row.originalQuantity !== undefined && row.quantity !== undefined) {
+            o.filledQuantity = Math.max(0, row.originalQuantity - row.quantity);
           }
-        }
-        return undefined;
-      };
-
-      const now = Date.now();
-      const CANCEL_GRACE = Math.max(this.config.orderTtlMinutes * 60_000, 120_000); // long: real cancel/expire only
-      for (const o of [...this.store.orders.values()]) {
-        if (activeReqIds.has(o.requestId)) {
-          // Resting on the book → placed; clear any gone marker.
-          if (o.goneSince) o.goneSince = undefined;
-          if (o.status !== 'placed') this.store.updateOrderStatus(o.requestId, 'placed');
+          const norm = normalizeStatus(row.status ?? '');
+          if (norm === 'cancelled') {
+            this.store.markCancelled(o.requestId); // authoritative: canceled/expired
+            continue;
+          }
+          if (norm === 'placed') {
+            if (o.status !== 'placed') this.store.updateOrderStatus(o.requestId, 'placed');
+            continue;
+          }
+          // Order filled → settlement bucket from its trades (default settling
+          // until they confirm settled). Never settle without proof.
+          const st = o.orderId ? tradesByOrderId.get(o.orderId) : undefined;
+          this.store.updateOrderStatus(o.requestId, st && st.length > 0 ? settlementBucket(st) : 'settling');
           continue;
         }
-        // Gone from the book. Resolve its order_id (from active earlier, or claim
-        // its own fill trade now), then read settlement from THAT order_id's trades.
-        if (!o.orderId) {
-          const oid = claimOrderId(o);
-          if (oid) this.store.resolveOrderId(o.requestId, oid);
-        }
-        const matched = o.orderId ? (byOrderId.get(o.orderId) ?? []) : [];
-        if (matched.length > 0) {
-          // Filled → settlement bucket (pending → settling → settled).
-          o.goneSince = undefined;
-          this.store.updateOrderStatus(o.requestId, settlementBucket(matched.map((t) => t.status)));
-        } else {
-          // No trade for this order yet. Almost always it filled and the trade
-          // hasn't surfaced — keep waiting. Only after a LONG grace (real
-          // cancel/expire, no fill) mark it cancelled.
-          o.goneSince ??= now;
-          if (now - o.goneSince >= CANCEL_GRACE) this.store.markCancelled(o.requestId);
-        }
+        // No by-request row: adopted `t:` fill (settle via trades) or a transient
+        // lookup miss → progress by trades if possible, else leave as-is (no guess).
+        const st = o.orderId ? tradesByOrderId.get(o.orderId) : undefined;
+        if (st && st.length > 0) this.store.updateOrderStatus(o.requestId, settlementBucket(st));
       }
 
       // Balance detail for the dashboard (NOT used to infer settlement).
@@ -394,22 +389,47 @@ export class Orchestrator implements DepositManager {
     }
   }
 
-  private warnedNoReqId = false;
-  private warnNoRequestId(_orderId: string): void {
-    if (this.warnedNoReqId) return;
-    this.warnedNoReqId = true;
-    this.store.recordError(
-      'reconcile',
-      'getActiveOrders returned orders without request_id — cannot join to tracked orders. Verify API shape.',
-    );
-  }
-
   // --- DepositManager (serialized across pairs) ---
 
   requestDeposit(symbol: string): Promise<void> {
     // Chain deposits so only one runs at a time (no double-spend / gas races).
     this.depositChain = this.depositChain.then(() => this.maybeDeposit(symbol));
     return this.depositChain;
+  }
+
+  /**
+   * User-triggered withdrawal (CLI `withdraw` / Telegram `/withdraw`). Serialized
+   * on the SAME chain as deposits so the wallet is never used by two flows at
+   * once. Brings up the wallet lazily (proxy). Returns a human status string.
+   */
+  requestWithdraw(asset: string, amount: number): Promise<string> {
+    const run = this.depositChain.then(() => this.doWithdraw(asset, amount));
+    // Keep the (void) chain alive regardless of this call's result/throw.
+    this.depositChain = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private async doWithdraw(asset: string, amount: number): Promise<string> {
+    if (!Number.isFinite(amount) || amount <= 0) return `jumlah tidak valid: ${amount}`;
+    let walletApi: Wallet;
+    try {
+      walletApi = await this.ensureWallet();
+    } catch (e) {
+      return `wallet gagal init: ${e instanceof Error ? e.message : String(e)}`;
+    }
+    try {
+      this.store.note('withdraw', `tarik ${amount} ${asset} dari trading → wallet…`);
+      await walletApi.payDueGasIfAny().catch(() => 0); // clear any pending ledger gas first
+      await this.sdk.withdraw(asset, amount);
+      const gas = await walletApi.payDueGasIfAny().catch(() => 0);
+      const msg = `withdraw ${amount} ${asset} sukses${gas > 0 ? ` (gas ${gas} CC)` : ''}`;
+      this.store.note('withdraw', msg);
+      return `✔ ${msg}`;
+    } catch (e) {
+      const emsg = e instanceof Error ? e.message : String(e);
+      this.store.recordError('withdraw', emsg);
+      return `⚠️ withdraw ${amount} ${asset} GAGAL: ${emsg}`;
+    }
   }
 
   /**
@@ -421,6 +441,19 @@ export class Orchestrator implements DepositManager {
     if (this.stopped || this.store.userPaused) return;
     const orders = this.store.ordersForPair(symbol);
     if (!shouldDeposit({ orders, remainingThresholdN: this.config.remainingThresholdN })) return;
+
+    // Cooldown: one deposit (the largest asset) per refill cycle. A just-deposited
+    // amount hasn't reflected in the trading balance yet, so skip re-depositing
+    // (which would pick the next-largest asset) until the funds land.
+    const last = this.lastDepositAt.get(symbol) ?? 0;
+    const sinceLast = Date.now() - last;
+    if (sinceLast < DEPOSIT_COOLDOWN_MS) {
+      if (this.cooldownNotedFor.get(symbol) !== last) {
+        this.cooldownNotedFor.set(symbol, last);
+        this.store.note('deposit', `${symbol}: baru saja deposit — tunggu dana masuk ke trading (~${Math.round((DEPOSIT_COOLDOWN_MS - sinceLast) / 1000)}s), skip biar tak deposit dobel`);
+      }
+      return;
+    }
 
     // First deposit brings up the wallet + proxy (lazily). If it fails (all
     // proxies down), trading keeps running; we just skip the refill this round.
@@ -479,6 +512,7 @@ export class Orchestrator implements DepositManager {
       if (ccFee > 0) this.store.note('deposit', `bayar gas ledger ${ccFee} CC sebelum deposit`);
       await this.sdk.deposit(amount, asset);
       this.store.recordDeposit(asset, amount, true, ccFee);
+      this.lastDepositAt.set(symbol, Date.now()); // start the cooldown (one deposit/refill)
       const t = this.store.depositTotals();
       this.store.note(
         'deposit',

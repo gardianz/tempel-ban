@@ -42,6 +42,16 @@ describe('Store 5-state lifecycle', () => {
     expect(s.counters.volumeQuote).toBeCloseTo(60000 * 0.0001);
   });
 
+  it('settled volume uses filledQuantity (partial fill) when set, not order size', () => {
+    const s = new Store();
+    s.initPair('CBTC/USDA', 'buy');
+    const o = order('1');
+    o.filledQuantity = 0.00006; // partially filled 60% of 0.0001
+    s.addOrder(o);
+    s.updateOrderStatus('1', 'settled');
+    expect(s.counters.volumeQuote).toBeCloseTo(60000 * 0.00006); // filled, not 0.0001
+  });
+
   it('orderCounts buckets placed/pending/settling', () => {
     const s = new Store();
     s.initPair('CBTC/USDA', 'buy');

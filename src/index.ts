@@ -9,11 +9,20 @@ import { loadStats, saveStats } from './services/stats-store.js';
 import { Store } from './state/store.js';
 import { Orchestrator } from './workers/orchestrator.js';
 import { Dashboard } from './ui/dashboard.js';
+import { selectPairsInteractive } from './ui/prompt.js';
 import { installRateLimitObserver } from './services/ratelimit-observer.js';
 
 async function main(): Promise<void> {
   const env = loadEnv();
   const config = loadConfig();
+
+  // Interactive startup: ask which configured pairs to run this session (TTY
+  // only; PAIRS env or non-TTY skips it). Mutates config.pairs[].enabled.
+  const chosen = await selectPairsInteractive(config);
+  if (chosen.length === 0) {
+    console.error('Tidak ada pair yang dipilih — tidak ada yang dijalankan. Keluar.');
+    process.exit(0);
+  }
 
   // 1. Init the Temple SDK with the API key ONLY. Trading (orders, book,
   // balances) uses X-API-Key over a DIRECT connection — no wallet, no proxy.
@@ -25,6 +34,8 @@ async function main(): Promise<void> {
   const store = new Store();
   store.network = env.NETWORK;
   store.walletParty = env.LOOP_PARTY_ID;
+  store.orderSpacingMs = config.orderSpacingSec * 1000;
+  store.rateLimitCooldownMs = config.rateLimitCooldownSec * 1000;
 
   // Cumulative stats persist across restarts (volume, fills, deposits, etc.).
   const statsPath = resolve(process.cwd(), process.env.STATS_FILE ?? 'data/stats.json');
@@ -47,13 +58,15 @@ async function main(): Promise<void> {
     if (info.retryAfter !== undefined) limiter.pauseFor(info.retryAfter * 1000);
   });
 
-  const telegram = new TelegramNotifier(env);
-  telegram.attach(store, config.summaryIntervalMin);
-
   const orchestrator = new Orchestrator(sdk, env, store, config);
+  // User-triggered withdrawal (CLI / Telegram), serialized on the deposit chain.
+  const withdraw = (asset: string, amount: number) => orchestrator.requestWithdraw(asset, amount);
+
+  const telegram = new TelegramNotifier(env);
+  telegram.attach(store, config.summaryIntervalMin, withdraw);
 
   // 4. Dashboard (headless-safe: only when attached to a TTY).
-  const dashboard = process.stdout.isTTY ? new Dashboard(store) : undefined;
+  const dashboard = process.stdout.isTTY ? new Dashboard(store, undefined, withdraw) : undefined;
   dashboard?.start();
 
   // Headless: no dashboard to render events, so log them to stdout.

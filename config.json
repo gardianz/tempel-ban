@@ -5,6 +5,8 @@
   ],
   "budgetPerOrder": 150,
   "orderTtlMinutes": 5,
+  "orderSpacingSec": 2,
+  "rateLimitCooldownSec": 30,
   "onBelowMin": "skip",
   "maxOpenOrders": "auto",
   "remainingThresholdN": 0,

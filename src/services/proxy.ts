@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { ProxyAgent, setGlobalDispatcher } from 'undici';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import axios from 'axios';
@@ -54,4 +55,24 @@ export function parseProxyList(raw: string | undefined): string[] {
     .split(/[\n,]/)
     .map((s) => s.trim())
     .filter(Boolean);
+}
+
+/**
+ * Load a proxy pool from a plain text file (one proxy URL per line) — the easy
+ * way to manage proxies without cramming them into an env var. Blank lines and
+ * lines starting with `#` (comments) are ignored. A missing file yields []
+ * (proxies are optional; trading runs direct). NEVER commit this file: it holds
+ * proxy credentials and the repo is public — keep proxy.txt in .gitignore.
+ */
+export function loadProxyFile(path: string): string[] {
+  let raw: string;
+  try {
+    raw = readFileSync(path, 'utf8');
+  } catch {
+    return [];
+  }
+  return raw
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .filter((l) => l && !l.startsWith('#'));
 }

@@ -53,6 +53,10 @@ export const configSchema = z.object({
    * guarantees the order crosses; the server still fills at the real market price.
    */
   marketSlippagePct: z.number().nonnegative().default(0.005),
+  /** Spacing between order submits within a batch (seconds). Default 2s. */
+  orderSpacingSec: z.number().nonnegative().default(2),
+  /** Cooldown after a rate-limit (429/249) before submitting again (seconds). Default 30s. */
+  rateLimitCooldownSec: z.number().positive().default(30),
   ratePerMinute: z.number().positive().default(30),
   maxRatePerMinute: z.number().positive().default(60),
   /** Min gap between API requests (ms) — spaces bursts under a per-second server cap. */
@@ -78,6 +82,8 @@ export const envSchema = z.object({
   PROXY_URL: z.string().optional(),
   /** Newline/comma-separated proxy pool for rotation. */
   PROXY_LIST: z.string().optional(),
+  /** Path to a proxy pool file (one proxy URL per line). Default: ./proxy.txt. */
+  PROXY_FILE: z.string().optional(),
   /** 'wallet' (default): proxy only cantonloop/loop. 'all': also Temple REST. */
   PROXY_SCOPE: z.enum(['wallet', 'all']).default('wallet'),
 });

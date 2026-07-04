@@ -53,8 +53,12 @@ export interface TrackedOrder {
   settleMs?: number;
   /** Estimated CC reward this order earned (set on settle, from the 30d reward/volume ratio). */
   estRewardCc?: number;
-  /** First time the order was seen gone from the active book (for cancel grace). */
-  goneSince?: number;
+  /**
+   * Actually FILLED base quantity (original − remaining), from the by-request
+   * lookup. Used instead of the order size for volume so partial fills don't
+   * over-count. Undefined until reconcile observes the order.
+   */
+  filledQuantity?: number;
 }
 
 /** Per-pair runtime status surfaced to the dashboard. */

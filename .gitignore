@@ -2,6 +2,9 @@ node_modules/
 .env
 .env.*
 !.env.example
+# Proxy pool file — holds proxy credentials; NEVER commit (repo is public).
+proxy.txt
+!proxy.txt.example
 dist/
 *.log
 capture/

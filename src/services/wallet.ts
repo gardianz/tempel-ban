@@ -1,6 +1,7 @@
+import { resolve } from 'node:path';
 import { LoopSDK } from '@fivenorth/loop-sdk/server';
 import type { Env } from '../config/index.js';
-import { applyProxy, parseProxyList, maskProxy, type ProxyScope } from './proxy.js';
+import { applyProxy, parseProxyList, loadProxyFile, maskProxy, type ProxyScope } from './proxy.js';
 
 export interface Wallet {
   /** Loop SDK instance to pass as Temple's WALLET_ADAPTER. */
@@ -57,7 +58,12 @@ export async function initWalletWithProxyRotation(
   scope: ProxyScope,
   perAttemptMs = 20_000,
 ): Promise<{ wallet: Wallet; proxy?: string }> {
-  const pool = [env.PROXY_URL, ...parseProxyList(env.PROXY_LIST)].filter((p): p is string => Boolean(p));
+  // Pool = PROXY_URL + PROXY_LIST (env) + proxy.txt (file, the easy way). The file
+  // path defaults to ./proxy.txt, override with PROXY_FILE. All merged + deduped.
+  const filePath = resolve(process.cwd(), env.PROXY_FILE ?? 'proxy.txt');
+  const pool = [env.PROXY_URL, ...parseProxyList(env.PROXY_LIST), ...loadProxyFile(filePath)].filter(
+    (p): p is string => Boolean(p),
+  );
   const proxies = [...new Set(pool)];
   if (proxies.length === 0) {
     return { wallet: await initWallet(env), proxy: undefined };
