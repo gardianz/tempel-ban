@@ -15,6 +15,21 @@ export interface SizeOrderInput {
 
 export type SizeOrderResult = { quantity: number } | { skip: true; reason: string };
 
+/**
+ * Count the decimal places in `n` (e.g. the exchange minimum_quantity), used to
+ * derive quantity precision. Must account for BOTH the exponent AND the mantissa
+ * fraction: 0.00015 → "1.5e-4" → 5 places (exp 4 + 1 mantissa digit), not 4.
+ * The old exponent-only version undercounted (0.00015 → 4), which floored an
+ * order like 0.00016 down to 0.0001 < min → the bot skipped every order.
+ */
+export function decimalsOf(n: number): number {
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  const [mantissa, expPart] = n.toExponential().split('e');
+  const exp = Number(expPart);
+  const mantissaFraction = (mantissa!.split('.')[1] ?? '').length;
+  return Math.max(0, mantissaFraction - exp);
+}
+
 /** Floor `value` to `decimals` places without binary-float drift. */
 export function floorToDecimals(value: number, decimals: number): number {
   if (decimals < 0) decimals = 0;

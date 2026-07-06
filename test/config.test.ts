@@ -6,7 +6,7 @@ describe('configSchema', () => {
   it('applies defaults', () => {
     const c = configSchema.parse({ pairs: [{ symbol: 'CC/USDA' }], budgetPerOrder: 100 });
     expect(c.orderTtlMinutes).toBe(10);
-    expect(c.onBelowMin).toBe('skip');
+    expect(c.onBelowMin).toBe('bump');
     expect(c.pairs[0]!.side).toBe('auto');
     expect(c.pairs[0]!.enabled).toBe(true);
   });

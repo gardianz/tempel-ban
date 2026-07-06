@@ -42,6 +42,7 @@ export class Orchestrator implements DepositManager {
   private readonly cooldownNotedFor = new Map<string, number>();
   private reconcileTimer?: NodeJS.Timeout;
   private wsUnsub?: () => void;
+  private wsTradesUnsub?: () => void;
   private readonly liveBooks: LiveOrderbook[] = [];
   private stopped = false;
   /** Lazily initialized (proxy + Loop auth) on the first deposit only. */
@@ -187,6 +188,7 @@ export class Orchestrator implements DepositManager {
     for (const lob of this.liveBooks) lob.close();
     if (this.reconcileTimer) clearInterval(this.reconcileTimer);
     this.wsUnsub?.();
+    this.wsTradesUnsub?.();
     temple.disconnectWebSocket();
   }
 
@@ -227,30 +229,32 @@ export class Orchestrator implements DepositManager {
   // --- status pipeline ---
 
   private subscribeUserOrders(): void {
+    // Order status (placed/filled/canceled). NOTE: this feed's `quantity`
+    // (remaining) is settlement-adjusted and unreliable for fill amount — the
+    // fill qty comes from the trades feed (subscribeUserTrades + reconcile).
     this.wsUnsub = temple.subscribeUserOrders((data: unknown) => {
-      const o = data as {
-        order_id?: string;
-        request_id?: string | number;
-        status?: string;
-        quantity?: string | number; // REMAINING (string on the wire, e.g. "0")
-        original_quantity?: string | number;
-      };
+      const o = data as { order_id?: string; request_id?: string | number; status?: string };
       if (!o.status) return;
-      // Prefer request_id (our tracking key). Fall back to order_id -> request_id.
-      let requestId: string | undefined =
-        o.request_id !== undefined ? String(o.request_id) : undefined;
+      let requestId: string | undefined = o.request_id !== undefined ? String(o.request_id) : undefined;
       if (!requestId && o.order_id) requestId = this.store.findRequestIdByOrderId(String(o.order_id));
-      if (!requestId) return;
-      // Real-time filled qty (original − remaining) straight off the WS push, so
-      // the per-order fill bar updates immediately instead of waiting up to
-      // pollIntervalSec for the reconcile (which caused filled orders to sit at
-      // 0% / partial fills to look "stuck"). Set BEFORE applyStatus so a WS-driven
-      // settle also books volume against the real filled amount.
-      if (o.original_quantity !== undefined && o.quantity !== undefined) {
-        const tracked = this.store.orders.get(requestId);
-        if (tracked) tracked.filledQuantity = Math.max(0, num(o.original_quantity) - num(o.quantity));
-      }
-      this.applyStatus(requestId, o.status);
+      if (requestId) this.applyStatus(requestId, o.status);
+    });
+
+    // Real-time FILL amount: each user trade adds its base qty to the matching
+    // tracked order (by order_id), so the per-order fill bar advances the instant
+    // a fill lands instead of waiting for the reconcile. Volume on a WS-driven
+    // settle then reflects the real filled amount.
+    // subscribeUserTrades exists at runtime but is missing from the SDK's .d.ts.
+    const subscribeUserTrades = (temple as unknown as {
+      subscribeUserTrades: (cb: (d: unknown) => void) => (() => void);
+    }).subscribeUserTrades;
+    this.wsTradesUnsub = subscribeUserTrades((data: unknown) => {
+      const t = data as { order_id?: string; quantity?: string | number };
+      if (!t.order_id) return;
+      const reqId = this.store.findRequestIdByOrderId(String(t.order_id));
+      if (!reqId) return;
+      const o = this.store.orders.get(reqId);
+      if (o) o.filledQuantity = Math.min(o.quantity, (o.filledQuantity ?? 0) + num(t.quantity));
     });
   }
 
@@ -303,23 +307,32 @@ export class Orchestrator implements DepositManager {
       } catch (e) {
         this.store.recordError('trades', e instanceof Error ? e.message : String(e));
       }
+      // order_id → trade settlement statuses AND summed filled base qty. The
+      // trades feed is the ONLY reliable fill source: by-request's `quantity`
+      // (remaining) is settlement-adjusted and stays = original for a FILLED maker
+      // order (status "filled", remaining=original), so original−remaining gives 0.
       const tradesByOrderId = new Map<string, string[]>();
+      const filledByOrderId = new Map<string, number>();
       for (const t of trades) {
         if (!t.order_id) continue;
         let arr = tradesByOrderId.get(t.order_id);
         if (!arr) tradesByOrderId.set(t.order_id, (arr = []));
         arr.push((t.status ?? '').toLowerCase());
+        filledByOrderId.set(t.order_id, (filledByOrderId.get(t.order_id) ?? 0) + num(t.quantity));
       }
 
       for (const o of tracked) {
         const row = byReq.get(o.requestId);
+        if (row?.orderId) this.store.resolveOrderId(o.requestId, row.orderId);
+        // Filled base qty from the trades feed (monotonic: fills only grow, and the
+        // 150-trade window can drop old rows). Drives the per-order fill bar + volume.
+        if (o.orderId) {
+          const filled = filledByOrderId.get(o.orderId);
+          // Authoritative when trades are present (corrects any WS interim drift);
+          // keep the last value when they've aged out of the window (never drop).
+          if (filled !== undefined) o.filledQuantity = Math.min(o.quantity, filled);
+        }
         if (row) {
-          if (row.orderId) this.store.resolveOrderId(o.requestId, row.orderId);
-          // Track the actually-filled base qty (original − remaining) for accurate
-          // volume — partial fills would otherwise count the full order size.
-          if (row.originalQuantity !== undefined && row.quantity !== undefined) {
-            o.filledQuantity = Math.max(0, row.originalQuantity - row.quantity);
-          }
           const norm = normalizeStatus(row.status ?? '');
           if (norm === 'cancelled') {
             this.store.markCancelled(o.requestId); // authoritative: canceled/expired

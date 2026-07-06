@@ -2,7 +2,7 @@ import type { TempleSdk } from '../services/sdk.js';
 import type { Store } from '../state/store.js';
 import type { Config, PairConfig } from '../config/index.js';
 import { budgetFor } from '../config/index.js';
-import { sizeOrder, sizeByQuantity } from '../core/order-sizer.js';
+import { sizeOrder, sizeByQuantity, decimalsOf } from '../core/order-sizer.js';
 import { RateLimiter } from '../core/ratelimiter.js';
 import { shouldRequote } from '../core/requote-policy.js';
 import { isLive, isResting } from '../core/status.js';
@@ -53,16 +53,6 @@ function roundTo(n: number, decimals: number, dir: 'up' | 'down'): number {
   const f = 10 ** decimals;
   const r = dir === 'up' ? Math.ceil(n * f) : Math.floor(n * f);
   return r / f;
-}
-
-/** Count decimal places of a number (0.0001 → 4, 100 → 0). */
-function decimalsOf(n: number): number {
-  if (!Number.isFinite(n) || n <= 0) return 0;
-  const s = n.toExponential();
-  const m = /e-(\d+)$/.exec(s);
-  if (m) return Number(m[1]);
-  const dot = String(n).indexOf('.');
-  return dot < 0 ? 0 : String(n).length - dot - 1;
 }
 
 /**

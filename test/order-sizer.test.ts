@@ -1,5 +1,25 @@
 import { describe, it, expect } from 'vitest';
-import { sizeOrder, sizeByQuantity, floorToDecimals } from '../src/core/order-sizer.js';
+import { sizeOrder, sizeByQuantity, floorToDecimals, decimalsOf } from '../src/core/order-sizer.js';
+
+describe('decimalsOf', () => {
+  it('counts exponent AND mantissa fraction (0.00015 → 5, not 4)', () => {
+    expect(decimalsOf(0.0001)).toBe(4);
+    expect(decimalsOf(0.00015)).toBe(5);
+    expect(decimalsOf(0.00016)).toBe(5);
+    expect(decimalsOf(0.0005)).toBe(4);
+    expect(decimalsOf(0.001)).toBe(3);
+    expect(decimalsOf(1.25)).toBe(2);
+    expect(decimalsOf(100)).toBe(0);
+    expect(decimalsOf(0)).toBe(0);
+  });
+
+  it('does not floor a valid qty below a fractional minimum (regression)', () => {
+    // min 0.00015 → 5 decimals; 0.00016 must survive flooring and clear the min.
+    const dec = decimalsOf(0.00015);
+    const r = sizeByQuantity({ quantity: 0.00016, minimumQuantity: 0.00015, maxDecimals: dec, onBelowMin: 'skip' });
+    expect(r).toEqual({ quantity: 0.00016 });
+  });
+});
 
 describe('floorToDecimals', () => {
   it('floors to given decimals', () => {

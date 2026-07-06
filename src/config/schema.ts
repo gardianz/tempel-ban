@@ -33,7 +33,12 @@ export const configSchema = z.object({
   /** Default order size as a QUOTE-currency notional (used when a pair has no quantityPerOrder). */
   budgetPerOrder: z.number().positive(),
   orderTtlMinutes: z.number().positive().default(10),
-  onBelowMin: z.enum(['bump', 'skip']).default('skip'),
+  /**
+   * When the sized order quantity is below the exchange minimum: `bump` (default)
+   * auto-uses the minimum so a raised min-order-size never stalls the bot; `skip`
+   * skips the order (strict cost control).
+   */
+  onBelowMin: z.enum(['bump', 'skip']).default('bump'),
   /**
    * Max concurrent resting orders per pair. `"auto"` derives it from the symbol's
    * order rate × TTL (how many can accumulate before the first re-quote), capped

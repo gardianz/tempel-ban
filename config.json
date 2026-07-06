@@ -7,7 +7,7 @@
   "orderTtlMinutes": 5,
   "orderSpacingSec": 2,
   "rateLimitCooldownSec": 30,
-  "onBelowMin": "skip",
+  "onBelowMin": "bump",
   "maxOpenOrders": "auto",
   "remainingThresholdN": 0,
   "marketSlippagePct": 0.005,
