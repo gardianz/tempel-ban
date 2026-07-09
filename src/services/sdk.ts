@@ -36,16 +36,26 @@ function toTempleError(e: unknown): TempleApiError {
   return new TempleApiError(err?.message ?? String(e), err?.status, err?.code, e);
 }
 
-/** The SDK signals failure by RESOLVING with this shape (it never throws). */
+/**
+ * The SDK signals failure by RESOLVING with an error-shaped object (it never
+ * throws). Two shapes exist:
+ *   - REST/trading:  { error: true, status, code, message }
+ *   - Canton ledger: { error: "<message string>" }   (deposit/withdraw/onboard/merge)
+ * Both use a TRUTHY `error` key. Matching only `error === true` (the old check)
+ * let the string-error shape slip through as a "success" — a failed deposit was
+ * recorded as sukses and the balance never landed. Detect either.
+ */
 interface SdkError {
-  error: true;
-  status: number | null;
-  code: string | number | null;
-  message: string;
+  error: true | string;
+  status?: number | null;
+  code?: string | number | null;
+  message?: string;
   retry_after?: number;
 }
 function isSdkError(v: unknown): v is SdkError {
-  return Boolean(v) && typeof v === 'object' && (v as { error?: unknown }).error === true;
+  if (!v || typeof v !== 'object') return false;
+  const e = (v as { error?: unknown }).error;
+  return e === true || (typeof e === 'string' && e.length > 0);
 }
 
 /** Pull a Retry-After (ms) hint off an error-as-value if present. */
@@ -121,9 +131,12 @@ export class TempleSdk {
       // (network/axios) is still possible.
       throw toTempleError(e);
     }
-    // SDK signals failure by resolving with { error:true, status, code, message }.
+    // SDK signals failure by resolving with an error-shaped object (never throws).
     if (isSdkError(out)) {
-      const err = new TempleApiError(out.message, out.status ?? undefined, out.code ?? undefined, out);
+      // Canton ledger errors carry the message in `error` (a string); REST errors
+      // in `message`. Prefer whichever is present.
+      const message = typeof out.error === 'string' ? out.error : (out.message ?? 'SDK error');
+      const err = new TempleApiError(message, out.status ?? undefined, out.code ?? undefined, out);
       // Back the shared limiter off on a general rate-limit signal only.
       if (err.isRateLimited && feedRateLimit) this.rl.on429(retryAfterMs(out));
       throw err;

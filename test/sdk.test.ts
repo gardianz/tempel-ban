@@ -29,6 +29,21 @@ describe('error-as-value handling', () => {
     await expect(sdk.getTradingBalance()).rejects.toBeInstanceOf(TempleApiError);
   });
 
+  it('throws when SDK resolves the canton string-error shape { error: "<msg>" }', async () => {
+    // deposit/withdraw/onboard return { error: "<message>" } (error is a STRING).
+    // The old check only matched error===true, so a failed deposit slipped through
+    // as success and the balance never landed. It must throw with the string message.
+    const { sdk } = makeSdk();
+    mock.getTradingBalance.mockResolvedValue({ error: 'Failed to get active contracts.' });
+    await expect(sdk.getTradingBalance()).rejects.toMatchObject({ message: 'Failed to get active contracts.' });
+  });
+
+  it('does NOT treat an empty-string error as a failure', async () => {
+    const { sdk } = makeSdk();
+    mock.getTradingBalance.mockResolvedValue({ error: '', balances: [] });
+    await expect(sdk.getTradingBalance()).resolves.toBeDefined();
+  });
+
   it('feeds 429 into the rate limiter (halves rate) and throws', async () => {
     const { sdk, rl } = makeSdk();
     mock.getActiveOrders.mockResolvedValue({ error: true, status: 429, code: 'RATE', message: 'slow down' });
