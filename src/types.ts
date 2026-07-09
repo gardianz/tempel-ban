@@ -59,6 +59,12 @@ export interface TrackedOrder {
    * over-count. Undefined until reconcile observes the order.
    */
   filledQuantity?: number;
+  /**
+   * When a past-TTL cancel fails (order raced us / momentarily uncancellable),
+   * suppress re-quoting THIS order until this timestamp so we don't spam cancel
+   * every tick. Reconcile stays the authority that finally clears it.
+   */
+  requoteBackoffUntil?: number;
 }
 
 /** Per-pair runtime status surfaced to the dashboard. */

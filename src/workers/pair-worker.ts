@@ -40,6 +40,14 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
  */
 const MAX_ACTIVE_ORDERS = 50;
 
+/**
+ * After a past-TTL cancel fails, suppress re-quoting that order for this long so
+ * it can't spam cancel every tick. Sized above the reconcile interval so the
+ * authority (reconcile) has a full cycle to observe the server's real state and
+ * clear the order before we'd retry.
+ */
+const REQUOTE_BACKOFF_MS = 25_000;
+
 /** Why a place loop stopped — lets the tick distinguish rate-limit from no-funds. */
 type PlaceReason = 'progress' | 'rate-limited' | 'no-funds' | 'cap' | 'no-price' | 'below-min';
 interface PlaceResult {
@@ -207,6 +215,9 @@ export class PairWorker {
     for (const o of this.store.ordersForPair(this.pair.symbol)) {
       // Only resting orders are re-quotable.
       if (!isResting(o.status) || !o.orderId) continue;
+      // A recent failed cancel backs this order off so we don't spam cancel every
+      // tick while reconcile catches up to the server's real state.
+      if (o.requoteBackoffUntil && now < o.requoteBackoffUntil) continue;
       const ageMs = now - o.placedAt;
       if (!shouldRequote({ status: o.status, ageMs, ttlMs })) continue;
       try {
@@ -214,9 +225,21 @@ export class PairWorker {
         await this.sdk.cancelOrder(o.orderId);
         this.store.markCancelled(o.requestId);
       } catch (e) {
-        // 404/raced: the order already filled or expired server-side — leave it;
-        // the reconciler reads its real settlement from the trades feed.
-        this.store.note(`requote:${this.pair.symbol}`, `cancel dilewati (order sudah hilang/terisi): ${e instanceof Error ? e.message : String(e)}`);
+        // Cancel raced us: the order already filled/expired, or is momentarily
+        // uncancellable (mid-settlement, rate-limited). Back THIS order off so we
+        // don't re-fire cancel every tick, and let reconcile be the sole authority
+        // to remove it — it settles fills via the trades feed and cancels expired
+        // orders via by-request, so dropping the order here (and losing a just-in
+        // fill's volume) is never needed. The real detail hides in `.cause`:
+        // Error() coerces an object message to "[object Object]", so log the raw
+        // error body instead.
+        const err = e as TempleApiError;
+        o.requoteBackoffUntil = now + REQUOTE_BACKOFF_MS;
+        const detail = err?.cause ? JSON.stringify(err.cause) : (err?.message ?? String(e));
+        this.store.note(
+          `requote:${this.pair.symbol}`,
+          `cancel gagal (status ${err?.status ?? '?'}) — tunda re-quote order ini ${Math.round(REQUOTE_BACKOFF_MS / 1000)}s: ${detail}`,
+        );
       }
     }
   }
