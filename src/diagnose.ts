@@ -75,29 +75,60 @@ async function main() {
   }
 
   // --- Optional: deposit test (spend asset for the enabled pair's buy side) ---
+  // Routes through OUR TempleSdk wrapper (the real bot path), NOT raw temple.deposit.
+  // That is what exercises the silent-failure fix: a failed deposit resolves as
+  // { error: "<msg>" } (error is a STRING) and the wrapper must THROW, not report
+  // "sukses". A raw temple.deposit() call would hide that.
   if (doDeposit) {
+    const { RateLimiter } = await import('./core/ratelimiter.js');
+    const { TempleSdk } = await import('./services/sdk.js');
+    const limiter = new RateLimiter({
+      ratePerMinute: config.ratePerMinute,
+      maxRatePerMinute: config.maxRatePerMinute,
+      minIntervalMs: config.minRequestIntervalMs,
+      initialTokens: 10,
+    });
+    const sdk = new TempleSdk(limiter, { network: env.NETWORK, apiKey: env.TEMPLE_API_KEY });
+
     const depositAsset = pair.symbol.split('/')[1]!; // quote (USDA) for a buy
     const amount = Number(argValue('--amount') ?? 15);
-    console.log(`\nDEPOSIT TEST: ${amount} ${depositAsset} (wallet -> trading). Reserves 10 CC for fees.`);
+    console.log(`\nDEPOSIT TEST (via TempleSdk wrapper): ${amount} ${depositAsset} (wallet -> trading). Reserves 10 CC for fees.`);
     if (!Number.isFinite(amount) || amount <= 0 || amount > 100) {
       throw new Error(`Refusing deposit: unsafe amount ${amount}. Pass --amount=N (<=100).`);
     }
-    dump('getTradingBalance BEFORE', await temple.getTradingBalance());
+
+    const unlockedOf = (bal: Record<string, { unlocked: number }>, asset: string): number => bal[asset]?.unlocked ?? 0;
+    const before = await sdk.getTradingBalanceDetailed();
+    const beforeAmt = unlockedOf(before, depositAsset);
+    console.log(`trading ${depositAsset} unlocked BEFORE = ${beforeAmt}`);
+    dump('wallet balances BEFORE', await sdk.getWalletBalances(wallet.partyId));
+
+    let threw = false;
     try {
       await wallet.payDueGasIfAny();
-      const res = await temple.deposit(amount, depositAsset);
-      dump('deposit (raw)', res);
+      const res = await sdk.deposit(amount, depositAsset);
+      console.log('deposit() returned WITHOUT throwing → wrapper treated as success:', JSON.stringify(res));
     } catch (e) {
-      console.log('deposit threw:', (e as Error).message);
+      threw = true;
+      console.log('deposit() THREW (fix working — no more silent sukses):', (e as Error).message);
     }
-    // Deposit credits on-chain; poll a few times to see it land.
-    for (let i = 0; i < 5; i++) {
+
+    // Deposit credits on-chain then the exchange picks it up — settlement lag can
+    // be 30-60s. Poll up to 60s before declaring it didn't land.
+    let landed = false;
+    for (let i = 0; i < 20; i++) {
       await sleep(3000);
-      const bal = await temple.getTradingBalance();
-      const usda = (bal as { balances?: { asset: string; unlocked: string }[] }).balances?.find((b) => b.asset === depositAsset);
-      console.log(`poll ${i + 1}: trading ${depositAsset} unlocked = ${usda?.unlocked ?? '?'}`);
+      const bal = await sdk.getTradingBalanceDetailed();
+      const now = unlockedOf(bal, depositAsset);
+      console.log(`poll ${i + 1}: trading ${depositAsset} unlocked = ${now} (Δ ${(now - beforeAmt).toFixed(6)})`);
+      if (now >= beforeAmt + amount * 0.99) { landed = true; break; }
     }
-    dump('getTradingBalance AFTER', await temple.getTradingBalance());
+
+    console.log('\n=== DEPOSIT VERDICT ===');
+    if (landed && !threw) console.log(`✅ PASS: balance landed (+${amount} ${depositAsset}) and wrapper reported success.`);
+    else if (!landed && threw) console.log('✅ PASS (failure path): deposit failed AND was surfaced as a throw — no silent false-sukses.');
+    else if (landed && threw) console.log('⚠️ balance landed but wrapper threw — unexpected; inspect the error above.');
+    else console.log('❌ FAIL: balance did NOT land and no throw — this is the silent-failure bug. Fix regressed.');
   }
 
   if (!canary) {

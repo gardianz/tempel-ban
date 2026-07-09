@@ -11,6 +11,73 @@ export interface Wallet {
   payDueGasIfAny(): Promise<number>;
 }
 
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * cantonloop.com's `/account/active-contracts` endpoint is tightly rate-limited:
+ * a 2nd call within ~100ms of the 1st returns 429. But the Temple deposit flow
+ * fires `getActiveContracts` 2–3× in a burst — getUtxoCount for CC, getUtxoCount
+ * for the utility asset, then prepareDepositHoldings — all fetching the SAME
+ * holdings. The later calls 429, the loop-sdk surfaces a bare "Failed to get
+ * active contracts.", and the deposit reads that as "0 balance" → aborts with
+ * "insufficient <asset>". Net effect: deposits silently never land even though
+ * the wallet is funded.
+ *
+ * Harden the provider's getActiveContracts:
+ *   1. short-TTL cache — collapses the burst of identical reads into ONE request;
+ *   2. serialize + min-space real requests so back-to-back calls can't 429;
+ *   3. retry a failed read with backoff (the loop-sdk hides the HTTP status, so
+ *      treat the generic failure as the retryable 429 it almost always is).
+ * Idempotent — guards against double-wrapping across lazy re-inits.
+ */
+function hardenLoopProvider(loop: LoopSDK): void {
+  const provider = ((loop as unknown as { provider?: Record<string, unknown> }).provider ?? loop) as Record<
+    string,
+    unknown
+  > & { __acHardened?: boolean };
+  const orig = provider.getActiveContracts as ((p: unknown) => Promise<unknown>) | undefined;
+  if (typeof orig !== 'function' || provider.__acHardened) return;
+  const bound = orig.bind(provider);
+
+  const MIN_GAP_MS = 1200; // spacing between real cantonloop active-contracts calls
+  const CACHE_TTL_MS = 2500; // dedupe the deposit's identical burst reads
+  const MAX_RETRY = 4;
+  const cache = new Map<string, { at: number; value: unknown }>();
+  let chain: Promise<unknown> = Promise.resolve();
+  let lastAt = 0;
+
+  provider.getActiveContracts = (params: unknown) => {
+    const key = JSON.stringify(params ?? {});
+    const hit = cache.get(key);
+    if (hit && Date.now() - hit.at < CACHE_TTL_MS) return Promise.resolve(hit.value);
+
+    const run = chain.then(async () => {
+      const cached = cache.get(key);
+      if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.value;
+      for (let attempt = 0; ; attempt++) {
+        const wait = MIN_GAP_MS - (Date.now() - lastAt);
+        if (wait > 0) await sleep(wait);
+        lastAt = Date.now();
+        try {
+          const value = await bound(params);
+          cache.set(key, { at: Date.now(), value });
+          return value;
+        } catch (e) {
+          if (attempt >= MAX_RETRY) throw e;
+          await sleep(MIN_GAP_MS * (attempt + 1) + 500); // back off then retry the 429
+        }
+      }
+    });
+    // Keep the chain flowing regardless of any single call's outcome.
+    chain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  };
+  provider.__acHardened = true;
+}
+
 /**
  * Init the Loop SDK in server mode (local signing with the private key) and
  * authenticate. partyId is supplied via env (the signer needs it; it is not
@@ -24,6 +91,9 @@ export async function initWallet(env: Env): Promise<Wallet> {
     network: env.NETWORK,
   });
   await loop.authenticate();
+  // Throttle + cache the rate-limited cantonloop active-contracts endpoint so the
+  // deposit flow's burst reads don't 429 and abort the deposit as "0 balance".
+  hardenLoopProvider(loop);
 
   return {
     loop,
