@@ -41,12 +41,19 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const MAX_ACTIVE_ORDERS = 50;
 
 /**
- * After a past-TTL cancel fails, suppress re-quoting that order for this long so
- * it can't spam cancel every tick. Sized above the reconcile interval so the
- * authority (reconcile) has a full cycle to observe the server's real state and
- * clear the order before we'd retry.
+ * Base backoff after a past-TTL cancel fails: suppress re-quoting that order for
+ * this long so it can't spam cancel every tick. Sized above the reconcile
+ * interval so the authority (reconcile) has a full cycle to observe the server's
+ * real state and clear the order before we'd retry.
  */
-const REQUOTE_BACKOFF_MS = 25_000;
+const REQUOTE_BACKOFF_MS = 30_000;
+/**
+ * Cap on the exponential backoff. An order that is persistently uncancellable
+ * (a partially-filled sell the server won't cancel, seen resting for hours) must
+ * NOT loop: each failed cancel doubles the wait (30s, 60s, 120s, …) up to this
+ * ceiling, turning a per-tick storm into a rare retry.
+ */
+const REQUOTE_BACKOFF_MAX_MS = 30 * 60_000;
 
 /** Why a place loop stopped — lets the tick distinguish rate-limit from no-funds. */
 type PlaceReason = 'progress' | 'rate-limited' | 'no-funds' | 'cap' | 'no-price' | 'below-min';
@@ -234,11 +241,17 @@ export class PairWorker {
         // Error() coerces an object message to "[object Object]", so log the raw
         // error body instead.
         const err = e as TempleApiError;
-        o.requoteBackoffUntil = now + REQUOTE_BACKOFF_MS;
+        // Exponential backoff: each consecutive failure doubles the wait (capped),
+        // so a persistently uncancellable order escalates to a rare retry instead
+        // of looping. requoteFailures is cleared only when the order leaves `placed`
+        // (reconcile settles/cancels it and deletes it from the store).
+        o.requoteFailures = (o.requoteFailures ?? 0) + 1;
+        const backoffMs = Math.min(REQUOTE_BACKOFF_MS * 2 ** (o.requoteFailures - 1), REQUOTE_BACKOFF_MAX_MS);
+        o.requoteBackoffUntil = now + backoffMs;
         const detail = err?.cause ? JSON.stringify(err.cause) : (err?.message ?? String(e));
         this.store.note(
           `requote:${this.pair.symbol}`,
-          `cancel gagal (status ${err?.status ?? '?'}) — tunda re-quote order ini ${Math.round(REQUOTE_BACKOFF_MS / 1000)}s: ${detail}`,
+          `cancel gagal (status ${err?.status ?? '?'}, ke-${o.requoteFailures}) — tunda re-quote ${Math.round(backoffMs / 1000)}s: ${detail}`,
         );
       }
     }

@@ -65,6 +65,13 @@ export interface TrackedOrder {
    * every tick. Reconcile stays the authority that finally clears it.
    */
   requoteBackoffUntil?: number;
+  /**
+   * Count of consecutive failed re-quote cancels on this order. Drives an
+   * exponential backoff so an order that is persistently uncancellable (e.g. a
+   * partially-filled order the server won't let us cancel) escalates from a
+   * per-tick retry to a rare one, instead of looping forever.
+   */
+  requoteFailures?: number;
 }
 
 /** Per-pair runtime status surfaced to the dashboard. */
