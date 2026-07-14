@@ -4,8 +4,7 @@ import type { Config, PairConfig } from '../config/index.js';
 import { budgetFor } from '../config/index.js';
 import { sizeOrder, sizeByQuantity, decimalsOf } from '../core/order-sizer.js';
 import { RateLimiter } from '../core/ratelimiter.js';
-import { shouldRequote } from '../core/requote-policy.js';
-import { isLive, isResting } from '../core/status.js';
+import { isLive } from '../core/status.js';
 import { spendAsset, splitPair, usdValue, type Side, type TrackedOrder } from '../types.js';
 import { TempleApiError } from '../services/sdk.js';
 
@@ -40,20 +39,6 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
  */
 const MAX_ACTIVE_ORDERS = 50;
 
-/**
- * Base backoff after a past-TTL cancel fails: suppress re-quoting that order for
- * this long so it can't spam cancel every tick. Sized above the reconcile
- * interval so the authority (reconcile) has a full cycle to observe the server's
- * real state and clear the order before we'd retry.
- */
-const REQUOTE_BACKOFF_MS = 30_000;
-/**
- * Cap on the exponential backoff. An order that is persistently uncancellable
- * (a partially-filled sell the server won't cancel, seen resting for hours) must
- * NOT loop: each failed cancel doubles the wait (30s, 60s, 120s, …) up to this
- * ceiling, turning a per-tick storm into a rare retry.
- */
-const REQUOTE_BACKOFF_MAX_MS = 30 * 60_000;
 
 /** Why a place loop stopped — lets the tick distinguish rate-limit from no-funds. */
 type PlaceReason = 'progress' | 'rate-limited' | 'no-funds' | 'cap' | 'no-price' | 'below-min';
@@ -209,54 +194,6 @@ export class PairWorker {
   }
 
 
-  /**
-   * Cancel + drop any resting order past its TTL so it can be re-placed at best.
-   * Only TTL drives re-quoting — orders also carry a server-side `expires_at`
-   * (TTL + 30s) as a backstop. (No off-top/drift re-quote: it churned cancels in
-   * a fast market and raced the server, producing a storm of 404s on already-gone
-   * orders.)
-   */
-  private async requoteStale(): Promise<void> {
-    const ttlMs = this.config.orderTtlMinutes * 60_000;
-    const now = Date.now();
-    for (const o of this.store.ordersForPair(this.pair.symbol)) {
-      // Only resting orders are re-quotable.
-      if (!isResting(o.status) || !o.orderId) continue;
-      // A recent failed cancel backs this order off so we don't spam cancel every
-      // tick while reconcile catches up to the server's real state.
-      if (o.requoteBackoffUntil && now < o.requoteBackoffUntil) continue;
-      const ageMs = now - o.placedAt;
-      if (!shouldRequote({ status: o.status, ageMs, ttlMs })) continue;
-      try {
-        this.store.note('requote', `${o.side} @${o.price} TTL lewat → re-quote at best`);
-        await this.sdk.cancelOrder(o.orderId);
-        this.store.markCancelled(o.requestId);
-      } catch (e) {
-        // Cancel raced us: the order already filled/expired, or is momentarily
-        // uncancellable (mid-settlement, rate-limited). Back THIS order off so we
-        // don't re-fire cancel every tick, and let reconcile be the sole authority
-        // to remove it — it settles fills via the trades feed and cancels expired
-        // orders via by-request, so dropping the order here (and losing a just-in
-        // fill's volume) is never needed. The real detail hides in `.cause`:
-        // Error() coerces an object message to "[object Object]", so log the raw
-        // error body instead.
-        const err = e as TempleApiError;
-        // Exponential backoff: each consecutive failure doubles the wait (capped),
-        // so a persistently uncancellable order escalates to a rare retry instead
-        // of looping. requoteFailures is cleared only when the order leaves `placed`
-        // (reconcile settles/cancels it and deletes it from the store).
-        o.requoteFailures = (o.requoteFailures ?? 0) + 1;
-        const backoffMs = Math.min(REQUOTE_BACKOFF_MS * 2 ** (o.requoteFailures - 1), REQUOTE_BACKOFF_MAX_MS);
-        o.requoteBackoffUntil = now + backoffMs;
-        const detail = err?.cause ? JSON.stringify(err.cause) : (err?.message ?? String(e));
-        this.store.note(
-          `requote:${this.pair.symbol}`,
-          `cancel gagal (status ${err?.status ?? '?'}, ke-${o.requoteFailures}) — tunda re-quote ${Math.round(backoffMs / 1000)}s: ${detail}`,
-        );
-      }
-    }
-  }
-
   private async tick(): Promise<void> {
     const meta = await this.loadMeta();
     // User pause (Telegram /stop): stop placing new orders; let resting ones settle.
@@ -285,7 +222,11 @@ export class PairWorker {
       settlingOrders: pairOrders.filter((o) => o.status === 'pending' || o.status === 'settling').length,
     });
 
-    await this.requoteStale();
+    // No re-quote: every limit order is placed with expires_at = TTL + 30s, so
+    // stale orders auto-expire server-side. Cancelling them ourselves only raced
+    // the server into a storm of 404s (cancel an already-gone order). Reconcile
+    // finalizes expired orders (settles fills, drops the rest); we just keep
+    // placing fresh orders at best.
 
     if (this.pair.pingpong) {
       await this.tickPingPong(meta);

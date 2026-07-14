@@ -22,6 +22,13 @@ const CC_FEE_RESERVE = 10; // SDK always keeps 10 CC for gas.
  */
 const DEPOSIT_COOLDOWN_MS = 60_000;
 
+/**
+ * Grace past an order's server-side expiry (expires_at = TTL + 30s) before
+ * reconcile finalizes it as an expired ghost. Covers clock skew + reconcile
+ * cadence so a still-live order is never expired early.
+ */
+const ORDER_EXPIRY_GRACE_MS = 120_000;
+
 const num = (v: unknown): number => {
   const n = typeof v === 'string' ? Number(v) : (v as number);
   return typeof n === 'number' && !Number.isNaN(n) ? n : 0;
@@ -291,14 +298,18 @@ export class Orchestrator implements DepositManager {
       //    synthetic adopted `t:oid` keys have no request_id → trades path below).
       const numericIds = tracked.map((o) => o.requestId).filter((id) => /^\d+$/.test(id));
       const byReq = new Map<string, OrderRow>();
+      let byReqOk = true; // gate the expiry cleanup — never finalize on a failed lookup
       if (numericIds.length > 0) {
         try {
           const { active, inactive } = await this.sdk.getOrdersByRequestIds(numericIds);
           for (const r of [...active, ...inactive]) if (r.requestId) byReq.set(r.requestId, r);
         } catch (e) {
+          byReqOk = false;
           this.store.recordError('reconcile', `by-request failed: ${e instanceof Error ? e.message : String(e)}`);
         }
       }
+      const now = Date.now();
+      const ttlMs = this.config.orderTtlMinutes * 60_000;
 
       // 2. Trades index (order_id -> trade statuses) for the settlement progression.
       let trades: Awaited<ReturnType<TempleSdk['getRecentUserTrades']>> = [];
@@ -335,7 +346,10 @@ export class Orchestrator implements DepositManager {
         if (row) {
           const norm = normalizeStatus(row.status ?? '');
           if (norm === 'cancelled') {
-            this.store.markCancelled(o.requestId); // authoritative: canceled/expired
+            // Authoritative canceled/expired. If it caught fills before expiring,
+            // settle so that volume counts; only a truly-unfilled order is dropped.
+            if ((o.filledQuantity ?? 0) > 0) this.store.updateOrderStatus(o.requestId, 'settled');
+            else this.store.markCancelled(o.requestId);
             continue;
           }
           if (norm === 'placed') {
@@ -351,7 +365,21 @@ export class Orchestrator implements DepositManager {
         // No by-request row: adopted `t:` fill (settle via trades) or a transient
         // lookup miss → progress by trades if possible, else leave as-is (no guess).
         const st = o.orderId ? tradesByOrderId.get(o.orderId) : undefined;
-        if (st && st.length > 0) this.store.updateOrderStatus(o.requestId, settlementBucket(st));
+        if (st && st.length > 0) {
+          this.store.updateOrderStatus(o.requestId, settlementBucket(st));
+          continue;
+        }
+        // Expired-ghost cleanup. Every limit order is placed with expires_at =
+        // TTL+30s, so once an order is well past that AND the server no longer
+        // lists it (no by-request row, no recent trades), it has expired
+        // server-side. Finalize it so it doesn't linger forever as a `placed`
+        // ghost — the bug behind the old re-quote 404 loop. Settle if it caught
+        // fills (counts the volume that was never recorded while it was stuck),
+        // else drop it. Only when the by-request lookup actually succeeded.
+        if (byReqOk && o.status === 'placed' && now - o.placedAt > ttlMs + ORDER_EXPIRY_GRACE_MS) {
+          if ((o.filledQuantity ?? 0) > 0) this.store.updateOrderStatus(o.requestId, 'settled');
+          else this.store.markCancelled(o.requestId);
+        }
       }
 
       // Balance detail for the dashboard (NOT used to infer settlement).
