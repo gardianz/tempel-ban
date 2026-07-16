@@ -107,3 +107,27 @@ describe('getActiveOrders', () => {
     expect(out[0]!.request_id).toBe(7);
   });
 });
+
+describe('getOrdersByRequestIds', () => {
+  it('tags rows with the active/inactive bucket (inactive = terminal server-side)', async () => {
+    // An expired partial fill keeps status "partially_filled" in inactive_orders;
+    // without the bucket flag it would normalize back to a live `placed` ghost.
+    const { sdk } = makeSdk();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          active_orders: [{ order_id: 'a1', request_id: 1, status: 'OPEN' }],
+          inactive_orders: [{ order_id: 'i1', request_id: 2, status: 'PARTIALLY_FILLED' }],
+        }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const { active, inactive } = await sdk.getOrdersByRequestIds([1, 2]);
+      expect(active).toEqual([expect.objectContaining({ orderId: 'a1', status: 'open', active: true })]);
+      expect(inactive).toEqual([expect.objectContaining({ orderId: 'i1', status: 'partially_filled', active: false })]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});

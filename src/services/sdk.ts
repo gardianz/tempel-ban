@@ -91,6 +91,14 @@ export interface OrderRow {
   /** Original order quantity (remaining < original ⇒ partial fill). */
   originalQuantity?: number;
   createdAt?: string;
+  /**
+   * Which by-request bucket the server returned this row in. `false` (from
+   * `inactive_orders`) means the order is TERMINAL server-side no matter what
+   * its `status` string says — an expired partial fill keeps status
+   * "partially_filled" forever, which would otherwise normalize back to a live
+   * `placed` and leave a ghost order in the store.
+   */
+  active: boolean;
 }
 
 function num(v: unknown): number | undefined {
@@ -189,7 +197,7 @@ export class TempleSdk {
       '/api/trading/orders/by-request',
       { request_ids: ids },
     );
-    const map = (arr: unknown[] | undefined): OrderRow[] =>
+    const map = (arr: unknown[] | undefined, active: boolean): OrderRow[] =>
       (arr ?? []).map((raw) => {
         const o = raw as Record<string, unknown>;
         return {
@@ -202,9 +210,10 @@ export class TempleSdk {
           quantity: num(o.quantity),
           originalQuantity: num(o.original_quantity),
           createdAt: o.created_at as string | undefined,
+          active,
         };
       });
-    return { active: map(res?.active_orders), inactive: map(res?.inactive_orders) };
+    return { active: map(res?.active_orders, true), inactive: map(res?.inactive_orders, false) };
   }
 
   async getSymbolConfig(symbol: string): Promise<{

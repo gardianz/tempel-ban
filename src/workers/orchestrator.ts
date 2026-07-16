@@ -345,18 +345,29 @@ export class Orchestrator implements DepositManager {
         }
         if (row) {
           const norm = normalizeStatus(row.status ?? '');
-          if (norm === 'cancelled') {
-            // Authoritative canceled/expired. If it caught fills before expiring,
-            // settle so that volume counts; only a truly-unfilled order is dropped.
-            if ((o.filledQuantity ?? 0) > 0) this.store.updateOrderStatus(o.requestId, 'settled');
-            else this.store.markCancelled(o.requestId);
+          if (!row.active) {
+            // inactive_orders row ⇒ TERMINAL server-side, regardless of the status
+            // string: an expired partial fill keeps status "partially_filled",
+            // which would normalize back to `placed` and ghost forever (seen live:
+            // 11h-old "placed" orders while the web showed Open Orders 0).
+            const st = o.orderId ? tradesByOrderId.get(o.orderId) : undefined;
+            if (st && st.length > 0) {
+              // Fills visible → walk the real settlement progression to settled.
+              this.store.updateOrderStatus(o.requestId, settlementBucket(st));
+            } else if ((o.filledQuantity ?? 0) > 0 || norm === 'pending') {
+              // Caught fills (or server says filled) but its trades already aged
+              // out of the window → settle now so the volume counts.
+              this.store.updateOrderStatus(o.requestId, 'settled');
+            } else {
+              this.store.markCancelled(o.requestId); // truly unfilled: canceled/expired
+            }
             continue;
           }
           if (norm === 'placed') {
             if (o.status !== 'placed') this.store.updateOrderStatus(o.requestId, 'placed');
             continue;
           }
-          // Order filled → settlement bucket from its trades (default settling
+          // Active but filled → settlement bucket from its trades (default settling
           // until they confirm settled). Never settle without proof.
           const st = o.orderId ? tradesByOrderId.get(o.orderId) : undefined;
           this.store.updateOrderStatus(o.requestId, st && st.length > 0 ? settlementBucket(st) : 'settling');
